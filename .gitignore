@@ -1,0 +1,12 @@
+.venv/
+.env
+.offerbomber/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+.workbuddy/tmp/
+.workbuddy/
+config.yaml
