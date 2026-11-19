@@ -48,8 +48,8 @@ profile:
   require_fact_verification: true
 
 resume:
-  # ResumePlan candidates are implemented; rendering through Reactive Resume is
-  # [NOT IMPLEMENTED] and reserved for a later phase.
+  # ResumePlan is implemented; Reactive Resume adapter requires a real API key
+  # (OFFERBOMBER_RXRESUME_API_KEY) — without it, generation fails explicitly.
   provider: reactive_resume
   tailor_per_job: true
   preserve_original: true
@@ -71,10 +71,19 @@ email:
   auto_reply_low_risk: false
 
 models:
-  # [NOT IMPLEMENTED] no model calls in this release; parsing is deterministic.
+  # mock | workbuddy | deepseek_harness | openai_compatible | auto
+  # 'auto' prefers a configured real host adapter, else falls back to mock.
+  # Credentials come from env vars, NEVER from this file:
+  #   workbuddy: OFFERBOMBER_WORKBUDDY_TOKEN
+  #   deepseek_harness: OFFERBOMBER_DSH_BIN (dsh on PATH)
+  #   openai_compatible: OFFERBOMBER_MODEL_BASE_URL / _API_KEY / _NAME
   preferred: auto
   reuse_host_model: true
   standalone_api_optional: true
+  timeout_seconds: 60
+  max_attempts: 3
+  # [NOT LIVE-VERIFIED] adapters use documented interfaces but need real credentials
+  # for live validation; mock results are never reported as real model calls.
 
 notifications:  # [NOT IMPLEMENTED] placeholder only
   use_host_connectors: true

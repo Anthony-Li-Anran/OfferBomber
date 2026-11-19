@@ -30,6 +30,16 @@ class ResumeSection(BaseModel):
     items: list[ResumeSectionItem] = Field(default_factory=list)
 
 
+class FactAudit(BaseModel):
+    """Provenance for one fact used in a generated resume."""
+    fact_id: int
+    fact_version: int = 1
+    source_id: int | None = None
+    original_text: str
+    rendered_text: str
+    experience_id: int
+
+
 class ResumePlan(BaseModel):
     job_id: str | None = None
     target_position: str
@@ -40,6 +50,10 @@ class ResumePlan(BaseModel):
     target_page_count: int = Field(default=2, ge=1, le=5)
     sections: list[ResumeSection] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Phase 3: structured provenance. Optional so Phase 2 callers stay valid.
+    fact_audit: list[FactAudit] = Field(default_factory=list)
+    highlight_skills: list[str] = Field(default_factory=list)
+    generation_provider: str = "deterministic"
 
 
 class ResumePlanBuilder:

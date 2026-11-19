@@ -1,14 +1,17 @@
 # OfferBomber
 
-Local-first personal job-hunting automation system. Phase 1 (job discovery) and Phase 2 (personal experience knowledge base) are implemented, tested and operable from the CLI.
+Local-first personal job-hunting automation system. Phase 1 (discovery), Phase 2 (experience knowledge base) and Phase 3 (model-driven JD → resume → PDF closed loop) are implemented, tested and operable from the CLI.
 
 ## Status
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Config, SQLite, Greenhouse/Lever/Ashby, dedup, filters, CLI | **Implemented & verified** |
-| 2 | PDF import, experience/fact KB, versioning, provenance, fact retrieval, ResumePlan | **Implemented & verified** |
-| 3-7 | Model adapters, Reactive Resume rendering, mail, applications, feedback, MCP, scheduler | Not implemented (no fake stubs) |
+| 2 | PDF import, experience/fact KB, versioning, provenance, FTS5 retrieval, ResumePlan | **Implemented & verified** |
+| 3 | ModelProvider, host adapters, model parsing, JD analysis, reranking, smart planning, Reactive Resume adapter, PDF validation | **Implemented; adapters not live-verified (need credentials)** |
+| 4-7 | Email, applications, feedback, MCP, scheduler | Not implemented (no fake stubs) |
+
+`offerbomber model doctor` and `offerbomber resume generate` report the exact live status. Mock results are never presented as real model calls or real PDF generation.
 
 `offerbomber status` / `offerbomber doctor` print the authoritative capability list. Config keys that exist for later phases are labelled `[NOT IMPLEMENTED]` in `config.example.yaml` and are never reported as working.
 
@@ -65,18 +68,45 @@ offerbomber fact delete 7
 # 5. Retrieval and resume planning
 offerbomber search facts "机器学习 预训练" --skill PyTorch --direction ai_infra
 offerbomber search facts "distributed training" --skill PyTorch
-offerbomber resume plan "distributed training" --skill PyTorch --job-id 42 --pages 2
+
+# 6. Phase 3 — model-driven JD-to-resume pipeline (uses configured ModelProvider)
+offerbomber model doctor                       # shows mock vs real, live-verified status
+offerbomber model test                         # structured-output smoke test
+offerbomber jobs analyze --job-id 42           # structured JobRequirements with JD evidence
+offerbomber search rerank "pytorch" --job-id 42
+offerbomber resume plan "pytorch" --job-id 42 --pages 1
+offerbomber resume generate --job-id 42 --source-resume-id <your-rxresume-id>
+offerbomber resume validate --file output/resumes/resume_42_x.pdf --name "Jane Doe"
+offerbomber resume versions --job-id 42
+offerbomber resume show --id 1
 ```
 
 Every command accepts `--config PATH`. See `examples/README.md` for an end-to-end walkthrough using a generated sample PDF and an isolated demo database.
 
 ## Design principles
 
-- **Truth source:** the experience database is authoritative. Models (when added later) may only organize or rewrite confirmed facts; they may not invent experience, grades, companies or metrics.
+- **Truth source:** the experience database is authoritative. Models may only organize or rewrite confirmed facts; they may not invent experience, grades, companies or metrics.
+- **Three-level verification:** `unit test` ≠ `mock end-to-end` ≠ `real host model / real Reactive Resume call`. Only a real credential-backed call sets `real_live_verified`; mock output is always labelled.
 - **Explicit IDs:** retrieval results and ResumePlan items carry concrete `Experience ID` and `Fact ID`, plus source type, locator and PDF SHA-256.
 - **Immutable history:** each experience change stores an immutable JSON snapshot. Restoring creates a new version; already-generated `resume_versions` snapshots are never modified.
 - **Confirmed-only planning:** `ResumePlan` excludes `UNVERIFIED` facts. A statement like "我的论文投了 ICML" stays verbatim and never becomes "ICML Accepted Paper".
-- **Bounded parsing:** the PDF parser is deterministic (headings, contacts, verbatim lines), not an LLM. Low-confidence candidates require human confirmation. Scanned PDFs are rejected with an explicit OCR limitation message.
+- **Bounded parsing:** `DeterministicResumeParser` stays as fallback. `profile import --parser model` uses a ModelProvider, but every candidate still requires human confirmation and quantitative/acceptance claims are checked against source text before entering candidates.
+- **Host model access:** a host calling OfferBomber over MCP does not grant OfferBomber the right to call the host model in reverse. Real access uses dedicated adapters (WorkBuddy cloud tasks + ACP, DeepSeek Harness headless CLI) with explicit credentials — never internal account secrets.
+
+## Model providers (verified interfaces, 2026-11-19)
+
+| Provider | Interface | Live status |
+|---|---|---|
+| `mock` | deterministic offline | test/demo only, never real |
+| `workbuddy` | `POST/GET /openapi/v2/tasks` + ACP SSE/JSON-RPC (`open.workbuddy.cn/docs/openapi`); no OpenAI-compatible endpoint | adapter implemented, **not live-verified** (needs `OFFERBOMBER_WORKBUDDY_TOKEN`) |
+| `deepseek_harness` | `dsh --profile headless [--json] [--session-id]` (`deepseek-ai/deepseek-harness` official CLI help) | adapter implemented, **not live-verified** (needs `dsh` on PATH) |
+| `openai_compatible` | generic `/chat/completions` for user-supplied endpoint | optional, off by default |
+
+Task types: `RESUME_EXTRACTION`, `JOB_ANALYSIS`, `EXPERIENCE_RERANKING`, `RESUME_PLANNING`, `RESUME_REWRITING`, `FACT_CONSISTENCY_CHECK`. All calls are async, Pydantic-validated, timed out, cancellable, classified, bounded-retry and logged; failures fall back safely.
+
+## Reactive Resume (verified interface, 2026-11-19)
+
+Adapter uses the official `/api/openapi` REST API with `x-api-key` auth: list/get resumes, `POST /resumes/{id}/copies` (clone; the primary resume is **never** edited), update content while preserving metadata/design/template, `GET /resumes/{id}/pdf`, PyMuPDF validation. No key → explicit failure, no fake PDF. Rate limits (1000/h per key, 5 PDF/min per resume) and errors (`code` field, 429) are handled. **Not live-verified** without `OFFERBOMBER_RXRESUME_API_KEY`.
 
 ## Data sources (verified 2026-11-19)
 
@@ -113,16 +143,18 @@ The full 25-table task-book schema plus `resume_imports` and the FTS5 virtual ta
 ## Tests
 
 ```bash
-PYTHONPATH=src pytest tests/ -q        # 35 passed
+PYTHONPATH=src pytest tests/ -q        # 76 passed
 ```
 
-Coverage includes Chinese dedup, malformed source isolation, single-record isolation, PDF extraction, duplicate PDF import, full experience creation, fact addition, version history, archive/restore, Chinese and English retrieval, requirement ranking, unconfirmed-fact exclusion, snapshot immutability, restart persistence and a fresh Alembic upgrade.
+Coverage includes Chinese dedup, malformed source isolation, single-record isolation, PDF extraction, duplicate PDF import, full experience creation, fact addition, version history, archive/restore, Chinese and English retrieval, requirement ranking, unconfirmed-fact exclusion, snapshot immutability, restart persistence, a fresh Alembic upgrade, FTS/revision consistency and atomic rollback on index failure (Phase 3 Part A), all model failure classes and safety guards, model parsing truthfulness, JD evidence separation, reranking ID validation, smart-planning budget/provenance, Reactive Resume mapping/validation/mock-HTTP flow, and four end-to-end scenarios (ML job, quant job, submission-not-accepted, service failure).
 
 ## Known limitations
 
-- PDF parsing is deterministic, not semantic; complex layouts, tables and scanned PDFs need a model/OCR or manual entry.
+- Scanned-PDF OCR is not available; the model parser explicitly reports unusable text instead of pretending success. Complex two-column reading order needs manual review.
 - `official_careers`, `search_engine`, `xiaohongshu_public` and `auto_expand_companies` are configuration placeholders only.
-- No model calls, Reactive Resume rendering, email, applications, reports, MCP or scheduling in this release.
+- Model host adapters are implemented against documented interfaces but **not live-verified** in this environment (no credentials). Without credentials, `auto` uses Mock and says so.
+- Reactive Resume generation requires a real API key and a source resume id; automated PDF checks cannot certify visual layout — human preview is required.
+- Email, applications, reports, MCP server and scheduling are not implemented in this release.
 - Recruitment email extraction is not implemented; `apply_method` stays `official_form`/`unknown`.
 
 ## License

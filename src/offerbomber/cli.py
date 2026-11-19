@@ -18,11 +18,17 @@ from sqlalchemy import select
 from .app import AppContext
 from .config import load_settings, unimplemented_capabilities, write_default_config
 from .core.discovery_service import DiscoveryService
+from .core.job_analysis import JobAnalyzer
+from .core.reranking import ModelReranker
 from .core.retrieval import FactRetrievalService, RetrievalQuery
-from .core.resume_plan import ResumePlanBuilder
+from .core.smart_planning import SmartResumePlanner
+from .integrations.reactive_resume import ReactiveResumeProvider
+from .models.factory import auto_select, build_provider, is_real
 from .profile.importer import ResumeImportService
+from .profile.model_parser import ModelResumeParser
+from .profile.pdf import PyMuPDFExtractor
 from .profile.service import ProfileKnowledgeBase
-from .storage.models import Company, Job
+from .storage.models import Company, Education, Experience, Job, Profile, ResumeVersion, ExperienceFact
 
 app = typer.Typer(
     name="offerbomber",
@@ -35,10 +41,12 @@ profile_app = typer.Typer(help="Profile and PDF resume import")
 experience_app = typer.Typer(help="Manage experiences")
 fact_app = typer.Typer(help="Manage atomic facts")
 search_app = typer.Typer(help="Search the experience knowledge base")
-resume_app = typer.Typer(help="Resume content planning (no rendering)")
+resume_app = typer.Typer(help="Resume planning, generation and versions")
+model_app = typer.Typer(help="Model provider diagnostics")
 for sub_app, name in (
     (jobs_app, "jobs"), (profile_app, "profile"), (experience_app, "experience"),
     (fact_app, "fact"), (search_app, "search"), (resume_app, "resume"),
+    (model_app, "model"),
 ):
     app.add_typer(sub_app, name=name)
 
@@ -68,6 +76,44 @@ def _split_csv(value: str | None) -> list[str]:
 
 def _echo_json(payload: object) -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _provider(ctx: AppContext, *, preferred: str | None = None):
+    """Build a model provider from config; explicit choice overrides config."""
+    name = preferred or ctx.settings.models.preferred
+    cfg = ctx.settings.models
+    if name == "auto":
+        return asyncio.run(auto_select(
+            timeout=cfg.timeout_seconds, max_attempts=cfg.max_attempts
+        ))
+    return build_provider(name, timeout=cfg.timeout_seconds, max_attempts=cfg.max_attempts)
+
+
+def _profile_data(ctx: AppContext, user_id: str):
+    """Load Profile, Education rows and Experience lookup for generation."""
+    with ctx.session() as session:
+        profile = session.execute(
+            select(Profile).where(Profile.user_id == user_id)
+        ).scalar_one_or_none()
+        educations = session.execute(
+            select(Education).where(Education.profile_id == profile.id)
+        ).scalars().all() if profile else []
+        experiences = {
+            exp.id: exp
+            for exp in session.execute(
+                select(Experience).where(Experience.user_id == user_id)
+            ).scalars().all()
+        }
+        return profile, list(educations), experiences
+
+
+def _job_by_id(ctx: AppContext, job_id: int) -> Job:
+    with ctx.session() as session:
+        job = session.get(Job, job_id)
+        if job is None:
+            raise typer.BadParameter(f"job {job_id} not found")
+        session.expunge(job)
+        return job
 
 
 @app.command()
@@ -125,7 +171,15 @@ def doctor(config: Path = typer.Option(None, "--config")) -> None:
     typer.echo(f"  db_path        : {settings.storage.db_path}")
     typer.echo(f"  fts5 available : {ctx.fts_available}")
     typer.echo(f"  configured boards: {len(enabled)}")
-    typer.echo("  implemented: config, SQLite, Greenhouse/Lever/Ashby, dedup, filters, profile KB")
+    typer.echo("  implemented: config, SQLite, Greenhouse/Lever/Ashby, dedup, filters, profile KB,")
+    typer.echo("    model abstraction, model parsing, JD analysis, reranking, smart planning, FTS consistency")
+    from .config import CAPABILITY_STATUS
+
+    adapters = {k: v for k, v in CAPABILITY_STATUS.items() if v == "adapter_implemented_not_live_verified"}
+    if adapters:
+        typer.echo("  adapters implemented but NOT live-verified (need credentials):")
+        for capability in sorted(adapters):
+            typer.echo(f"    - {capability}")
     typer.echo("  configured but NOT implemented:")
     for capability in unimplemented_capabilities():
         typer.echo(f"    - {capability}")
@@ -206,13 +260,21 @@ def profile_import(
     pdf: Path = typer.Argument(..., exists=True, readable=True, help="PDF resume to import"),
     user_id: str = typer.Option("default", "--user-id"),
     confirm_all: bool = typer.Option(False, "--confirm-all", help="confirm every candidate immediately"),
+    parser: str = typer.Option("deterministic", "--parser", help="deterministic | model"),
+    provider_name: str | None = typer.Option(None, "--provider"),
     as_json: bool = typer.Option(False, "--json"),
     config: Path = typer.Option(None, "--config"),
 ) -> None:
     """Extract a PDF resume into reviewable candidates (no facts are written by default)."""
     ctx = _require_config(config)
     service = ResumeImportService(ctx.sessions, user_id)
-    preview = service.preview(pdf)
+    if parser == "model":
+        model_parser = ModelResumeParser(_provider(ctx, preferred=provider_name))
+        preview = asyncio.run(service.apreview(pdf, model_parser))
+    elif parser == "deterministic":
+        preview = service.preview(pdf)
+    else:
+        raise typer.BadParameter("--parser must be 'deterministic' or 'model'")
     if as_json:
         _echo_json(
             {
@@ -530,25 +592,274 @@ def search_facts(
     ctx.close()
 
 
-@resume_app.command("plan")
-def resume_plan(
+# -- Phase 3: model diagnostics ------------------------------------------
+
+
+@model_app.command("doctor")
+def model_doctor(
+    provider_name: str | None = typer.Option(None, "--provider"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Check model provider availability. NEVER reports a mock as a live model."""
+    ctx = _require_config(config)
+    name = provider_name or ctx.settings.models.preferred
+    if name == "auto":
+        provider = asyncio.run(auto_select(
+            timeout=ctx.settings.models.timeout_seconds,
+            max_attempts=ctx.settings.models.max_attempts,
+        ))
+    else:
+        provider = _provider(ctx, preferred=name)
+    health = asyncio.run(provider.health_check())
+    _echo_json({
+        "selected": provider.name,
+        "requested": name,
+        "available": health.available,
+        "detail": health.detail,
+        "real_live_verified": health.real_live_verified,
+        "is_mock": not is_real(provider),
+    })
+    ctx.close()
+
+
+@model_app.command("test")
+def model_test(
+    provider_name: str | None = typer.Option(None, "--provider"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Run a structured-output smoke test against the selected provider."""
+    from .core.job_analysis import JobRequirements
+    from .models.base import TaskType
+
+    ctx = _require_config(config)
+    provider = _provider(ctx, preferred=provider_name)
+    schema = JobRequirements
+
+    async def _run():
+        result = await provider.generate_structured(
+            TaskType.JOB_ANALYSIS,
+            [{"role": "user", "content": "Return a JobRequirements JSON with job_id 0 and no requirements."}],
+            schema,
+        )
+        return result.model_dump()
+
+    try:
+        output = asyncio.run(_run())
+        _echo_json({
+            "success": True,
+            "provider": provider.name,
+            "is_mock": not is_real(provider),
+            "real_live_verified": is_real(provider),
+            "output": output,
+            "note": "mock success is NOT a real model call" if not is_real(provider) else "real provider responded",
+        })
+    except Exception as exc:  # noqa: BLE001 - CLI surfaces all errors
+        typer.echo(f"model test failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    ctx.close()
+
+
+# -- Phase 3: jobs / search / resume -------------------------------------
+
+
+@jobs_app.command("analyze")
+def jobs_analyze(
+    job_id: int = typer.Option(..., "--job-id"),
+    provider_name: str | None = typer.Option(None, "--provider"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Analyze a real stored job posting into structured JobRequirements."""
+    ctx = _require_config(config)
+    job = _job_by_id(ctx, job_id)
+    provider = _provider(ctx, preferred=provider_name)
+    result = asyncio.run(JobAnalyzer(provider).analyze(job))
+    _echo_json(result.model_dump())
+    ctx.close()
+
+
+@search_app.command("rerank")
+def search_rerank(
+    job_id: int = typer.Option(..., "--job-id"),
     text: str = typer.Argument(""),
     skill: list[str] | None = typer.Option(None, "--skill"),
-    direction: str | None = typer.Option(None),
-    job_id: str | None = typer.Option(None, "--job-id"),
-    language: str = typer.Option("zh"),
-    pages: int = typer.Option(2, "--pages", min=1, max=5),
+    provider_name: str | None = typer.Option(None, "--provider"),
+    limit: int = typer.Option(20, "--limit", min=1),
     user_id: str = typer.Option("default", "--user-id"),
     config: Path = typer.Option(None, "--config"),
 ) -> None:
-    """Build a ResumePlan from confirmed facts only. No PDF rendering here."""
+    """Two-stage retrieval: deterministic recall then model reranking."""
     ctx = _require_config(config)
-    retrieval = FactRetrievalService(ctx.sessions, user_id)
-    query = RetrievalQuery(text=text, required_skills=list(skill or []), direction=direction)
-    plan = ResumePlanBuilder(retrieval).build(
-        query, job_id=job_id, language=language, target_page_count=pages
-    )
+    job = _job_by_id(ctx, job_id)
+    provider = _provider(ctx, preferred=provider_name)
+
+    async def _run():
+        requirements = await JobAnalyzer(provider).analyze(job)
+        retrieval = FactRetrievalService(ctx.sessions, user_id)
+        query = RetrievalQuery(
+            text=text or job.title,
+            required_skills=list(skill or []),
+            direction=job.title,
+            max_results=limit,
+            verified_only=True,
+        )
+        candidates = retrieval.search(query)
+        ranked = await ModelReranker(provider).rerank(query, candidates, requirements)
+        return requirements, ranked
+
+    requirements, ranked = asyncio.run(_run())
+    _echo_json({
+        "job_id": job_id,
+        "provider": provider.name,
+        "is_mock": not is_real(provider),
+        "requirements": requirements.model_dump(),
+        "matches": [m.as_dict() for m in ranked],
+    })
+    ctx.close()
+
+
+@resume_app.command("plan")
+def resume_plan_smart(
+    text: str = typer.Argument(""),
+    job_id: int | None = typer.Option(None, "--job-id"),
+    skill: list[str] | None = typer.Option(None, "--skill"),
+    direction: str | None = typer.Option(None),
+    language: str = typer.Option("zh"),
+    pages: int = typer.Option(1, "--pages", min=1, max=2),
+    provider_name: str | None = typer.Option(None, "--provider"),
+    user_id: str = typer.Option("default", "--user-id"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Build a job-tailored ResumePlan from confirmed facts (no rendering)."""
+    ctx = _require_config(config)
+    provider = _provider(ctx, preferred=provider_name)
+    job = _job_by_id(ctx, job_id) if job_id is not None else None
+    profile, educations, _experiences = _profile_data(ctx, user_id)
+
+    async def _run():
+        requirements = await JobAnalyzer(provider).analyze(job) if job else None
+        retrieval = FactRetrievalService(ctx.sessions, user_id)
+        query = RetrievalQuery(
+            text=text or (job.title if job else ""),
+            required_skills=list(skill or []),
+            direction=direction or (job.title if job else None),
+            max_results=40,
+            verified_only=True,
+        )
+        candidates = retrieval.search(query)
+        ranked = await ModelReranker(provider).rerank(query, candidates, requirements)
+        return await SmartResumePlanner(provider, ctx.sessions).plan(
+            profile=profile, educations=educations, ranked_facts=ranked,
+            requirements=requirements, language=language, target_page_count=pages,
+        )
+
+    plan = asyncio.run(_run())
     _echo_json(plan.model_dump())
+    ctx.close()
+
+
+@resume_app.command("generate")
+def resume_generate(
+    job_id: int = typer.Option(..., "--job-id"),
+    source_resume_id: str = typer.Option(..., "--source-resume-id", help="your Reactive Resume base resume id (a clone is made)"),
+    provider_name: str | None = typer.Option(None, "--provider"),
+    language: str = typer.Option("zh"),
+    pages: int = typer.Option(1, "--pages", min=1, max=2),
+    output_dir: Path = typer.Option(None, "--output-dir"),
+    user_id: str = typer.Option("default", "--user-id"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Full JD-to-PDF flow. Requires a configured Reactive Resume API key."""
+    ctx = _require_config(config)
+    provider = _provider(ctx, preferred=provider_name)
+    rr = ReactiveResumeProvider()
+    health = asyncio.run(rr.health_check())
+    if not health["available"]:
+        typer.echo(f"Reactive Resume unavailable: {health['detail']}", err=True)
+        raise typer.Exit(code=2)
+
+    job = _job_by_id(ctx, job_id)
+    profile, educations, experiences = _profile_data(ctx, user_id)
+
+    async def _run():
+        requirements = await JobAnalyzer(provider).analyze(job)
+        retrieval = FactRetrievalService(ctx.sessions, user_id)
+        query = RetrievalQuery(text=job.title, direction=job.title, max_results=40, verified_only=True)
+        candidates = retrieval.search(query)
+        ranked = await ModelReranker(provider).rerank(query, candidates, requirements)
+        plan = await SmartResumePlanner(provider, ctx.sessions).plan(
+            profile=profile, educations=educations, ranked_facts=ranked,
+            requirements=requirements, language=language, target_page_count=pages,
+        )
+        target = output_dir or (Path.cwd() / "output" / "resumes")
+        return await rr.generate(
+            job_id=job_id, source_resume_id=source_resume_id, plan=plan,
+            profile=profile, educations=educations, experiences=experiences,
+            output_dir=target,
+        )
+
+    version = asyncio.run(_run())
+    with ctx.session() as session:
+        session.add(version)
+        session.commit()
+        version_id = version.id
+    typer.echo(f"created resume version {version_id}: {version.file_path}")
+    typer.echo(f"sha256={version.file_sha256}")
+    typer.echo("note: PDF passed automated checks only; review layout manually")
+    ctx.close()
+
+
+@resume_app.command("validate")
+def resume_validate(
+    file: Path = typer.Option(..., "--file", exists=True, readable=True),
+    name: str = typer.Option("", "--name"),
+    term: list[str] | None = typer.Option(None, "--term"),
+) -> None:
+    """Validate a PDF with PyMuPDF (exists/openable/text/name/key content)."""
+    report = ReactiveResumeProvider.validate_pdf(
+        file, expected_name=name, expected_terms=list(term or [])
+    )
+    _echo_json(report.as_dict())
+
+
+@resume_app.command("versions")
+def resume_versions(
+    job_id: int | None = typer.Option(None, "--job-id"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """List immutable generated resume versions."""
+    ctx = _require_config(config)
+    with ctx.session() as session:
+        stmt = select(ResumeVersion).order_by(ResumeVersion.id)
+        if job_id is not None:
+            stmt = stmt.where(ResumeVersion.job_id == job_id)
+        rows = session.execute(stmt).scalars().all()
+        _echo_json([
+            {
+                "id": row.id, "job_id": row.job_id, "file_path": row.file_path,
+                "file_sha256": row.file_sha256, "immutable": row.immutable,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ])
+    ctx.close()
+
+
+@resume_app.command("show")
+def resume_show(
+    id: int = typer.Option(..., "--id"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Show one generated resume version with its fact snapshot."""
+    ctx = _require_config(config)
+    with ctx.session() as session:
+        row = session.get(ResumeVersion, id)
+        if row is None:
+            raise typer.BadParameter(f"resume version {id} not found")
+        _echo_json({
+            "id": row.id, "job_id": row.job_id, "file_path": row.file_path,
+            "file_sha256": row.file_sha256, "immutable": row.immutable,
+            "fact_snapshot": json.loads(row.fact_snapshot) if row.fact_snapshot else [],
+        })
     ctx.close()
 
 
@@ -556,9 +867,11 @@ def resume_plan(
 def status(config: Path = typer.Option(None, "--config")) -> None:
     """Show the current system status and capability boundary."""
     ctx = _require_config(config)
-    typer.echo("OfferBomber 0.2.0 — Phase 1 + Phase 2")
-    typer.echo("implemented: config, SQLite schema, Greenhouse/Lever/Ashby, dedup, hard filters,")
-    typer.echo("  PDF import, experience/fact CRUD, versioning, fact retrieval, ResumePlan candidates")
+    typer.echo("OfferBomber 0.3.0 — Phase 1 + Phase 2 + Phase 3")
+    typer.echo("implemented: discovery, SQLite schema, FTS consistency, profile KB, PDF import,")
+    typer.echo("  versioning, fact retrieval, ModelProvider, model parsing, JD analysis,")
+    typer.echo("  reranking, smart ResumePlan, Reactive Resume adapter, PDF validation")
+    typer.echo("  NOTE: model host calls and Reactive Resume need real credentials for live use.")
     typer.echo("not implemented (configuration placeholders or later phases):")
     for capability in unimplemented_capabilities():
         typer.echo(f"  - {capability}")

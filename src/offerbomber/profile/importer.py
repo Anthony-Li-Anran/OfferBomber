@@ -10,7 +10,6 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ..storage.fts import index_fact
 from ..storage.models import Education, Experience, ExperienceFact, ResumeImport
 from .parsing import DeterministicResumeParser, ResumeParser
 from .pdf import PDFDocument, PDFTextExtractor, PyMuPDFExtractor
@@ -19,6 +18,7 @@ from .service import (
     CONFIRMED,
     ProfileKnowledgeBase,
     _dumps,
+    _sync_fact,
     utcnow,
 )
 
@@ -51,6 +51,16 @@ class ResumeImportService:
 
     def preview(self, path: str | Path) -> ImportPreview:
         document: PDFDocument = self.extractor.extract(path)
+        candidate = self.parser.parse(document)
+        return self._store(document, candidate)
+
+    async def apreview(self, path: str | Path, model_parser) -> ImportPreview:
+        """Async preview using a model parser (e.g. ModelResumeParser.parse)."""
+        document: PDFDocument = self.extractor.extract(path)
+        candidate = await model_parser.parse(document)
+        return self._store(document, candidate)
+
+    def _store(self, document: PDFDocument, candidate: CandidateProfile) -> ImportPreview:
         with self.sessions() as session:
             existing = session.execute(
                 select(ResumeImport).where(
@@ -59,7 +69,7 @@ class ResumeImportService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                candidate = (
+                stored_candidate = (
                     CandidateProfile.model_validate(json.loads(existing.candidate_payload))
                     if existing.candidate_payload
                     else CandidateProfile()
@@ -70,11 +80,10 @@ class ResumeImportService:
                     file_name=existing.file_name,
                     page_count=existing.page_count or 0,
                     extractable=existing.status != "REJECTED",
-                    candidate=candidate,
+                    candidate=stored_candidate,
                     warnings=[f"duplicate import (existing id={existing.id}, status={existing.status})"],
                 )
 
-            candidate = self.parser.parse(document)
             now = utcnow()
             rejected = not document.extractable
             row = ResumeImport(
@@ -230,10 +239,9 @@ class ResumeImportService:
                 self.kb.snapshot(session, experience, "IMPORT", f"imported from {row.file_name}")
             row.status = "IMPORTED"
             row.updated_at = utcnow()
-            session.commit()
             for fact in indexed:
-                index_fact(session, fact)
-            session.commit()
+                _sync_fact(session, fact)
+            session.commit()  # import + facts + index commit atomically
         return {
             "import_id": import_id,
             "experience_ids": experience_ids,

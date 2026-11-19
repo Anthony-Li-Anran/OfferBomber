@@ -31,11 +31,19 @@ CAPABILITY_STATUS: dict[str, str] = {
     "profile.fact_verification": "implemented",
     "profile.fact_retrieval": "implemented",
     "resume.plan_generation": "implemented",
-    "resume.reactive_resume_render": "not_implemented",
+    "resume.reactive_resume_render": "adapter_implemented_not_live_verified",
+    "resume.model_planning": "implemented",
+    "jobs.model_analysis": "implemented",
+    "search.model_reranking": "implemented",
     "applications.auto_prepare": "not_implemented",
     "applications.auto_send": "not_implemented",
     "email.sync": "not_implemented",
     "email.auto_reply": "not_implemented",
+    "models.provider_abstraction": "implemented",
+    "models.mock_provider": "implemented",
+    "models.workbuddy_provider": "adapter_implemented_not_live_verified",
+    "models.deepseek_harness_provider": "adapter_implemented_not_live_verified",
+    "models.openai_compatible_provider": "adapter_implemented_not_live_verified",
     "models.host_or_standalone_calls": "not_implemented",
     "notifications": "not_implemented",
     "reports": "not_implemented",
@@ -103,9 +111,12 @@ class EmailConfig(BaseModel):
 
 
 class ModelsConfig(BaseModel):
+    # mock | workbuddy | deepseek_harness | openai_compatible | auto
     preferred: str = "auto"
     reuse_host_model: bool = True
     standalone_api_optional: bool = True
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1, le=10)
 
 
 class NotificationsConfig(BaseModel):

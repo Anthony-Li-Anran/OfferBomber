@@ -12,10 +12,10 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ..storage.fts import index_fact
+from ..storage.fts import index_fact, reindex_experience
 from ..storage.models import (
     Education,
     Experience,
@@ -29,6 +29,13 @@ EXPERIENCE_TYPES = {
     "WORK", "INTERNSHIP", "RESEARCH", "PROJECT", "PAPER",
     "COMPETITION", "AWARD", "OPEN_SOURCE", "CUSTOM",
 }
+# Every operation that changes indexed content must go through one of these
+# helpers. Never commit inside an index helper — the caller owns the transaction.
+def _sync_fact(session: Session, fact: ExperienceFact) -> None:
+    """Index or un-index a fact according to its current state. No commit."""
+    index_fact(session, fact)
+
+
 EXPERIENCE_FIELDS = {
     "type", "title", "organization", "location", "start_date", "end_date",
     "status", "description", "tags",
@@ -288,10 +295,9 @@ class ProfileKnowledgeBase:
                 session.flush()
                 fact_rows.append(row)
             self.snapshot(session, experience, "CREATE", "experience created")
-            session.commit()
             for row in fact_rows:
-                index_fact(session, row)
-            session.commit()
+                _sync_fact(session, row)
+            session.commit()  # fact rows + index rows commit atomically
             return experience.id
 
     def list_experiences(self, *, include_archived: bool = False) -> list[dict]:
@@ -341,6 +347,9 @@ class ProfileKnowledgeBase:
             experience.current_version += 1
             experience.updated_at = utcnow()
             self.snapshot(session, experience, "UPDATE", note)
+            # The index embeds experience title and description; any edit to
+            # them must reindex every fact of this experience in this transaction.
+            reindex_experience(session, experience_id)
             session.commit()
             return self._experience_dict(experience)
 
@@ -376,6 +385,21 @@ class ProfileKnowledgeBase:
             return json.loads(row.snapshot)
 
     def restore(self, experience_id: int, version: int) -> dict:
+        """Restore an experience to an older immutable snapshot.
+
+        Invariants (Part A3):
+        - Fact IDs stay stable: a fact present in the snapshot is updated in
+          place, never re-created with a new ID.
+        - Fact versions never regress: restoring content bumps the version
+          monotonically instead of writing the old snapshot number back.
+        - Confirmation is monotonic: a fact that is currently CONFIRMED cannot
+          be downgraded to UNVERIFIED by restoring an older snapshot.
+        - Archival status is lifecycle state, not content: it is preserved
+          across a content restore.
+        - Historical snapshots are immutable: we only append a new RESTORE
+          version; previously stored snapshots are never modified.
+        - FTS index is rebuilt for the experience inside the same transaction.
+        """
         with self.sessions() as session:
             experience = self._get_experience(session, experience_id)
             row = session.execute(
@@ -388,38 +412,56 @@ class ProfileKnowledgeBase:
                 raise LookupError(f"version {version} not found for experience {experience_id}")
             payload = json.loads(row.snapshot)
             saved = payload["experience"]
-            for field in EXPERIENCE_FIELDS:
+
+            # status/archived_at are lifecycle fields: do not restore them.
+            for field in EXPERIENCE_FIELDS - {"status"}:
                 if field in saved:
                     setattr(experience, field, saved[field])
+
             existing = {
                 fact.id: fact
                 for fact in session.execute(
                     select(ExperienceFact).where(ExperienceFact.experience_id == experience_id)
                 ).scalars().all()
             }
+            snapshot_ids: set[int] = set()
             for item in payload["facts"]:
-                fact = existing.get(item["id"])
+                item_id = item.get("id")
+                fact = existing.get(item_id)
                 if fact is None:
+                    # Preserve the original fact ID so provenance and history stay stable.
                     fact = ExperienceFact(
+                        id=item_id,
                         experience_id=experience_id,
                         created_at=utcnow(),
-                        updated_at=utcnow(),
                     )
                     session.add(fact)
-                for field in (
-                    "content", "category", "skills", "source_id", "source_locator",
-                    "verification_status", "confidence", "version",
-                ):
+                    existing[item_id] = fact
+                for field in ("content", "category", "skills", "source_id", "source_locator", "confidence"):
                     setattr(fact, field, item.get(field))
+                # Confirmation is monotonic — never resurrect an old UNVERIFIED
+                # status over an already confirmed fact.
+                snapshot_status = item.get("verification_status", UNVERIFIED)
+                if fact.verification_status != CONFIRMED:
+                    fact.verification_status = snapshot_status
+                fact.version = max(int(fact.version or 0), int(item.get("version") or 0)) + 1
                 fact.is_deleted = False
                 fact.updated_at = utcnow()
                 session.flush()
+                snapshot_ids.add(item_id)
+
+            # Facts added after the restored snapshot become soft-deleted, not
+            # physically removed — their IDs and history remain reserved.
             for fact_id, fact in existing.items():
-                if fact_id not in {item["id"] for item in payload["facts"]}:
+                if fact_id not in snapshot_ids and not fact.is_deleted:
                     fact.is_deleted = True
+                    fact.updated_at = utcnow()
+
             experience.current_version += 1
             experience.updated_at = utcnow()
+            # Append a new immutable RESTORE snapshot; never rewrite `row`.
             self.snapshot(session, experience, "RESTORE", f"restored from version {version}")
+            reindex_experience(session, experience_id)
             session.commit()
             return self.detail(experience_id)
 
@@ -485,9 +527,8 @@ class ProfileKnowledgeBase:
             experience.current_version += 1
             experience.updated_at = now
             self.snapshot(session, experience, "FACT_ADD", "fact added")
-            session.commit()
-            index_fact(session, fact)
-            session.commit()
+            _sync_fact(session, fact)
+            session.commit()  # fact + index in one transaction
             return fact.id
 
     def verify_fact(self, fact_id: int) -> dict:
@@ -505,6 +546,8 @@ class ProfileKnowledgeBase:
                 experience.current_version += 1
                 experience.updated_at = utcnow()
                 self.snapshot(session, experience, "FACT_VERIFY", f"fact {fact_id} confirmed")
+                # Reindex so BM25/skills reflect the confirmed fact consistently.
+                _sync_fact(session, fact)
                 session.commit()
             return self._fact_dict(fact)
 
@@ -520,8 +563,6 @@ class ProfileKnowledgeBase:
                 experience.current_version += 1
                 experience.updated_at = utcnow()
                 self.snapshot(session, experience, "FACT_DELETE", f"fact {fact_id} deleted")
-                session.commit()
-                from ..storage.fts import FTS_TABLE
-
-                session.execute(text(f"DELETE FROM {FTS_TABLE} WHERE fact_id = :id"), {"id": fact_id})
+                # index_fact sees is_deleted=True and removes the row in-transaction.
+                _sync_fact(session, fact)
                 session.commit()
