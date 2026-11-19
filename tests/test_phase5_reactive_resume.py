@@ -122,9 +122,10 @@ async def test_mock_http_generate_clones_never_touches_source(tmp_path):
     pdf_bytes_path = tmp_path / "src.pdf"; pdf.save(str(pdf_bytes_path)); pdf.close()
     pdf_bytes = pdf_bytes_path.read_bytes()
 
+    clone_doc = {"id": "clone-2", "name": "clone", "data": dict(source_doc["data"])}
     with respx.mock:
-        respx.get(f"{BASE}/resumes/source-1").mock(return_value=httpx.Response(200, json=source_doc))
         respx.post(f"{BASE}/resumes/source-1/copies").mock(return_value=httpx.Response(201, json={"id": "clone-2"}))
+        respx.get(f"{BASE}/resumes/clone-2").mock(return_value=httpx.Response(200, json=clone_doc))
         respx.put(f"{BASE}/resumes/clone-2").mock(return_value=httpx.Response(200, json={"id": "clone-2"}))
         respx.get(f"{BASE}/resumes/clone-2/pdf").mock(return_value=httpx.Response(200, content=pdf_bytes))
 
@@ -145,8 +146,8 @@ async def test_mock_http_generate_clones_never_touches_source(tmp_path):
 async def test_export_failure_produces_no_file(tmp_path):
     provider = ReactiveResumeProvider(api_key="test-key", base_url=BASE)
     with respx.mock:
-        respx.get(f"{BASE}/resumes/source-1").mock(return_value=httpx.Response(200, json={"id": "source-1", "data": {}}))
         respx.post(f"{BASE}/resumes/source-1/copies").mock(return_value=httpx.Response(201, json={"id": "clone-3"}))
+        respx.get(f"{BASE}/resumes/clone-3").mock(return_value=httpx.Response(200, json={"id": "clone-3", "data": {}}))
         respx.put(f"{BASE}/resumes/clone-3").mock(return_value=httpx.Response(200, json={}))
         respx.get(f"{BASE}/resumes/clone-3/pdf").mock(return_value=httpx.Response(502, json={"code": "UPSTREAM", "message": "fail"}))
         with pytest.raises(ResumeGenerationError) as exc:

@@ -10,6 +10,7 @@ source resume's document and we only replace content fields.
 from __future__ import annotations
 
 import html
+import re
 import uuid
 from typing import Any
 
@@ -38,11 +39,42 @@ def _section(title: str, icon: str = "") -> dict[str, Any]:
     }
 
 
+def _normalize_date(value: str | None) -> str | None:
+    """Coerce resume date strings to the official YYYY or YYYY-MM format.
+
+    The Reactive Resume OpenAPI enforces /^\\d{4}(?:-(?:0[1-9]|1[0-2]))?$/ on
+    `dates.start`/`dates.end`. Real resumes use many separators (2026.07,
+    2026/07, 2026年07月, "July 2026", etc.), so normalize before sending.
+    Returns None for open-ended markers ("至今", "present", "now").
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text or re.search(r"至今|present|now|current|至今", text, re.I):
+        return None
+    match = re.search(r"(\d{4})\s*[.\-/年]\s*(\d{1,2})", text)
+    if match:
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    match = re.search(r"(\d{4})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_present(value: str | None) -> bool:
+    return bool(value and re.search(r"至今|present|now|current", str(value), re.I))
+
+
 def _dates(start: str | None, end: str | None) -> dict[str, Any]:
+    norm_start = _normalize_date(start)
+    norm_end = _normalize_date(end)
+    present = _is_present(end)
     return {
-        "start": start or None,
-        "end": end or None,
-        "present": False,
+        "start": norm_start,
+        "end": None if present else norm_end,
+        "present": present,
         "expected": False,
         "raw": " ".join(part for part in (start, end) if part),
     }
@@ -66,10 +98,14 @@ def map_resume_data(
         "customFields": [],
     }
     contact = (profile.contact if profile else None) or ""
-    if "@" in contact:
-        basics["email"] = contact.strip()
-    elif any(ch.isdigit() for ch in contact):
-        basics["phone"] = contact.strip()
+    email_match = re.search(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}", contact)
+    remainder = contact
+    if email_match:
+        basics["email"] = email_match.group(0)
+        remainder = contact[:email_match.start()] + " " + contact[email_match.end():]
+    phone_match = re.search(r"(?<!\d)(?:\+?\d[\d -]{6,}\d)(?!\d)", remainder)
+    if phone_match:
+        basics["phone"] = phone_match.group(0).strip()
 
     sections: dict[str, Any] = {
         "profiles": _section("Profiles"),

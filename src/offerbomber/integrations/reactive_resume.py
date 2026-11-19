@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,11 +106,22 @@ class ReactiveResumeProvider:
         self._raise_for_response(response)
         return response.json()
 
+    @staticmethod
+    def _unique_slug(name: str) -> str:
+        """Build a stable, ASCII-only, unique slug for a clone.
+
+        The API slugifies the name when slug is omitted, but CJK/emoji names can
+        collapse to a constant value and collide on repeated copies
+        (RESUME_SLUG_ALREADY_EXISTS). Supplying an explicit unique slug avoids it.
+        """
+        base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "resume"
+        return f"{base}-{uuid.uuid4().hex[:12]}"
+
     async def clone_resume(self, client: httpx.AsyncClient, source_id: str, name: str) -> str:
         response = await client.post(
             f"{self.base_url}/resumes/{source_id}/copies",
             headers={**self._headers(), "Content-Type": "application/json"},
-            json={"name": name},
+            json={"name": name, "slug": self._unique_slug(name)},
         )
         self._raise_for_response(response)
         data = response.json()
@@ -188,12 +201,16 @@ class ReactiveResumeProvider:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            source_doc = await self.get_resume(client, source_resume_id)
             clone_id = await self.clone_resume(
                 client, source_resume_id, f"OfferBomber job {job_id} {plan.target_position}"
             )
             try:
-                await self.update_resume(client, clone_id, source_doc, content)
+                # Re-read the clone as the write base: it already inherited the
+                # source's design/template but carries its OWN slug and metadata.
+                # Writing the source document back would overwrite the clone's
+                # slug with the source slug -> RESUME_SLUG_ALREADY_EXISTS.
+                clone_doc = await self.get_resume(client, clone_id)
+                await self.update_resume(client, clone_id, clone_doc, content)
                 pdf_bytes = await self.export_pdf(client, clone_id)
             except ResumeGenerationError:
                 log.warning("generation_failed_keeping_clone", clone_id=clone_id, job_id=job_id)

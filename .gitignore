@@ -10,3 +10,4 @@ build/
 .workbuddy/tmp/
 .workbuddy/
 config.yaml
+/output/

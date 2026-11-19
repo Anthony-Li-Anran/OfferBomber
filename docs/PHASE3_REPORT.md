@@ -41,7 +41,7 @@
 | 本地单元测试 | 是 | 76 passed |
 | 外部接口模拟测试 | 是 | respx 覆盖复制/更新/导出/失败；Mock Provider 覆盖故障矩阵 |
 | 真实宿主模型联调 | 否（缺凭证/环境） | `model doctor` 明确 `real_live_verified=false` |
-| 真实 Reactive Resume 联调 | 否（缺 API key） | `resume generate` 在无 key 时直接失败退出 |
+| 真实 Reactive Resume 联调 | **是（2026-11-20 补测）** | 真实 key + 真实简历跑通克隆→填充→导出→质检，生成 PDF 70KB；见第七节 |
 
 ## 六、已知限制与后续
 
@@ -49,3 +49,18 @@
 - WorkBuddy/DeepSeek Harness 适配基于当前官方文档，尚未在授权环境跑过；凭证到位后需执行一次真实联调。
 - 缓存复用（相同 job_id + 事实版本 + 模板）的数据结构已预留（`ResumeVersion` + `fact_snapshot`），但自动查重复用逻辑留待有真实服务后启用。
 - 邮件、投递、反馈、MCP Server、调度仍属后续阶段，本轮未提前开发。
+
+## 七、2026-11-20 真实 Reactive Resume 联调（补测）
+
+用户提供真实 API key 与本人简历 PDF（`SUFE-DS-LiAnran.pdf`），在本地跑通真实联调；明确：模型层仍用确定性构建器（无宿主模型凭证），只有 Reactive Resume HTTP 链路是真实的。
+
+- 连通性：`GET /api/health` 200（v6.1.1）；`GET /resumes` 用真实 key 列出源简历 `General Resume`（`01a05bd8…`）。
+- 真实链路：本地导入并确认简历事实（23 条事实、8 段经历、2 条教育，隔离 user）→ 确定性 `ResumePlan`（6 条事实、2 段）→ 克隆源简历 → 写回内容 → `GET /resumes/{id}/pdf` → PyMuPDF 质检。**结果：生成 PDF 成功（70,246 bytes，8/8 质检项通过，姓名与关键内容命中）。**
+- 联调暴露并修复 3 个 mock 测试覆盖不到的真实缺陷：
+  1. **日期格式校验**：6.1.1 对 `dates.start/end` 强制 `/^\d{4}(?:-(?:0[1-9]|1[0-2]))?$/`。中文简历的 `2026.07`/`2024.09` 原样透传导致 `BAD_REQUEST`。`schema_mapper._normalize_date` 统一归一到 `YYYY`/`YYYY-MM`，兼容 `.` `/` `-` `年` 及 `至今/present`。
+  2. **克隆 slug 冲突**：中文/符号标题 slug 化后恒定，重复生成触发 `RESUME_SLUG_ALREADY_EXISTS`。`clone_resume` 显式传入带 uuid 的 ASCII 唯一 slug。
+  3. **写回基底错误**：写回时误用源简历文档做基底，会把克隆体 slug 覆盖成源 slug（同样触发冲突）。改为克隆后重读克隆体文档做基底，仅替换内容字段，设计/模板保持不变。
+  - 附带修复联系方式拆分：邮箱支持多级域名、与电话分离（此前把整段联系方式塞进 email）。
+- 安全：源简历 `General Resume` 全程未被修改；测试产生的中间克隆副本已通过 `DELETE /resumes/{id}` 清理，仅保留 1 个成功副本；本地数据库已还原，临时脚本已删除。
+- 交付物：`output/deliverable/李安然_数据科学家_AI-Agent工程师_联调样例.pdf`（已加入 .gitignore，不入库）。
+- 复核：`pytest -q` 仍 **76 passed**；测试 mock 已同步反映「重读克隆体做基底」的新调用顺序。
