@@ -18,12 +18,13 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config_path = Path.cwd() / "config.yaml"
-if config_path.is_file():
-    settings = load_settings(config_path)
-    config.set_main_option("sqlalchemy.url", _sqlite_path_to_url(settings.storage.db_path))
-elif os.environ.get("OFFERBOMBER_DB_URL"):
+if os.environ.get("OFFERBOMBER_DB_URL"):
     config.set_main_option("sqlalchemy.url", os.environ["OFFERBOMBER_DB_URL"])
+else:
+    config_path = Path.cwd() / "config.yaml"
+    if config_path.is_file():
+        settings = load_settings(config_path)
+        config.set_main_option("sqlalchemy.url", _sqlite_path_to_url(settings.storage.db_path))
 
 target_metadata = Base.metadata
 

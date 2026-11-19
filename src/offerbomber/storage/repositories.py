@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from offerbomber.discovery.base import RawJob
+from offerbomber.discovery.base import RawJob, normalize_key
 from offerbomber.storage.models import Company, Job, JobSource, JobSourceRecord
 
 
@@ -51,6 +51,19 @@ def get_or_create_source(
     source.last_scanned_at = utcnow()
     source.last_error = None
     return source
+
+
+def record_source_error(session: Session, platform: str, token: str, message: str) -> None:
+    """Persist the last failure for a source after the failed unit was rolled back."""
+    source = session.execute(
+        select(JobSource).where(
+            JobSource.platform == platform, JobSource.board_token == token
+        )
+    ).scalar_one_or_none()
+    if source is not None:
+        source.last_error = message[:500]
+        source.updated_at = utcnow()
+        session.commit()
 
 
 def insert_job(session: Session, raw: RawJob, *, validity_status: str = "LIKELY_ACTIVE") -> Job:
@@ -125,6 +138,5 @@ def count_jobs(session: Session) -> int:
 
 
 def _norm(value: str) -> str:
-    import re
-
-    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    """Keep DB-side normalization identical to the dedup key function."""
+    return normalize_key(value)

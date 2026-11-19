@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from offerbomber.config import load_settings
 from offerbomber.storage.base import Base, make_engine
+from offerbomber.storage.fts import ensure_fts5
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ def settings():
 def session_factory():
     engine = make_engine(":memory:")
     Base.metadata.create_all(engine)
+    ensure_fts5(engine)
     yield sessionmaker(bind=engine, expire_on_commit=False)
     engine.dispose()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -46,7 +47,25 @@ def normalize_url(value: str | None) -> str:
 
 
 def normalize_key(value: str | None) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    """Unicode-safe key normalization for dedup and filters.
+
+    NFKC folds width/compatibility variants, casefold handles non-ASCII case,
+    punctuation becomes a separator, and CJK characters are preserved. Whitespace
+    *inside a CJK run* is removed so "字节 跳动" matches "字节跳动"; English word
+    boundaries and distinct Chinese names are never collapsed.
+    """
+    if not value:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
+    parts: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category[0] in {"L", "M", "N"}:
+            parts.append(char)
+        else:
+            parts.append(" ")
+    collapsed = re.sub(r"\s+", " ", "".join(parts)).strip()
+    return re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", collapsed)
 
 
 def sha256_of(*parts: str) -> str:
@@ -113,4 +132,12 @@ class DiscoverySource:
             raise
         except httpx.HTTPError as exc:  # defensive: HttpFetcher normally wraps this
             raise SourceFetchError(f"{self.platform} network error: {exc}") from exc
-        return self.parse_payload(payload, token, company_name)
+        try:
+            return self.parse_payload(payload, token, company_name)
+        except SourceFetchError:
+            raise
+        except Exception as exc:
+            # An unexpected response shape must not abort the whole discovery run.
+            raise SourceFetchError(
+                f"{self.platform} payload parse error for {token}: {type(exc).__name__}: {exc}"
+            ) from exc

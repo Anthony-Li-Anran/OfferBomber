@@ -1,0 +1,90 @@
+# Capability note: fields marked [NOT IMPLEMENTED] are configuration placeholders
+# for later phases. They do not enable any working feature in this release.
+# Run `offerbomber doctor` for the authoritative list.
+
+app:
+  name: OfferBomber
+  mode: personal
+  timezone: Asia/Shanghai
+  dry_run: true
+
+discovery:
+  enabled: true
+  auto_expand_companies: true  # [NOT IMPLEMENTED] placeholder only
+  interval_hours: 4
+  sources:
+    - greenhouse
+    - lever
+    - ashby
+    - official_careers       # [NOT IMPLEMENTED] placeholder only
+    - search_engine          # [NOT IMPLEMENTED] placeholder only
+    - xiaohongshu_public     # [NOT IMPLEMENTED] placeholder only
+  companies:
+    - platform: greenhouse
+      token: stripe
+      name: Stripe
+    - platform: lever
+      token: leverdemo
+      name: Lever Demo
+    - platform: ashby
+      token: ashby
+      name: Ashby
+
+matching:
+  broad_search: true
+  exclude_hard_mismatches: true
+  target_fields:
+    - pretraining
+    - posttraining
+    - ai_infra
+    - machine_learning
+    - quantitative_research
+    - quantitative_engineering
+
+profile:
+  allow_pdf_import: true
+  allow_manual_updates: true
+  store_fact_provenance: true
+  require_fact_verification: true
+
+resume:
+  # ResumePlan candidates are implemented; rendering through Reactive Resume is
+  # [NOT IMPLEMENTED] and reserved for a later phase.
+  provider: reactive_resume
+  tailor_per_job: true
+  preserve_original: true
+  validate_pdf: true
+  cache_base_versions: true
+
+applications:
+  # [NOT IMPLEMENTED] no application preparation or sending in this release.
+  auto_prepare: true
+  auto_send: false
+  max_emails_per_day: 20
+  require_verified_recipient: true
+  prevent_duplicates: true
+
+email:
+  # [NOT IMPLEMENTED] no mail sync or reply in this release.
+  provider: gmail
+  sync_minutes: 10
+  auto_reply_low_risk: false
+
+models:
+  # [NOT IMPLEMENTED] no model calls in this release; parsing is deterministic.
+  preferred: auto
+  reuse_host_model: true
+  standalone_api_optional: true
+
+notifications:  # [NOT IMPLEMENTED] placeholder only
+  use_host_connectors: true
+  urgent_enabled: true
+
+reports:  # [NOT IMPLEMENTED] placeholder only
+  daily_enabled: true
+  daily_time: "21:00"
+
+storage:
+  backend: sqlite
+  backups_enabled: true
+  db_path: .offerbomber/demo.db

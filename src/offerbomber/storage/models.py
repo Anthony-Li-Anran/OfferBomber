@@ -57,6 +57,12 @@ class Profile(Base, TimestampMixin):
     user_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(200))
     contact: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str | None] = mapped_column(Text)
+    target_position: Mapped[str | None] = mapped_column(String(200))
+    target_locations: Mapped[str | None] = mapped_column(Text)  # JSON
+    job_search_status: Mapped[str] = mapped_column(
+        String(40), default="OPEN", server_default="OPEN"
+    )
     job_preferences: Mapped[str | None] = mapped_column(Text)  # JSON
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
 
@@ -70,25 +76,40 @@ class Education(Base, TimestampMixin):
     major: Mapped[str | None] = mapped_column(String(200))
     start_date: Mapped[str | None] = mapped_column(String(32))
     end_date: Mapped[str | None] = mapped_column(String(32))
+    description: Mapped[str | None] = mapped_column(Text)
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("experience_sources.id", name="fk_educations_source")
+    )
 
 
 class Experience(Base, TimestampMixin):
     __tablename__ = "experiences"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("profiles.id", name="fk_experiences_profile")
+    )
     type: Mapped[str] = mapped_column(String(50), index=True)
     title: Mapped[str] = mapped_column(String(300))
     organization: Mapped[str | None] = mapped_column(String(200))
     location: Mapped[str | None] = mapped_column(String(200))
     start_date: Mapped[str | None] = mapped_column(String(32))
     end_date: Mapped[str | None] = mapped_column(String(32))
-    status: Mapped[str | None] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(
+        String(50), default="ACTIVE", server_default="ACTIVE", index=True
+    )
     description: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[str | None] = mapped_column(Text)  # JSON
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("experience_sources.id", name="fk_experiences_source")
+    )
+    current_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    archived_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
 
 
 class ExperienceFact(Base, TimestampMixin):
     __tablename__ = "experience_facts"
+    __table_args__ = (Index("ix_fact_verification", "verification_status", "is_deleted"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     experience_id: Mapped[int] = mapped_column(
         ForeignKey("experiences.id", ondelete="CASCADE"), index=True
@@ -96,29 +117,57 @@ class ExperienceFact(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String(80))
     skills: Mapped[str | None] = mapped_column(Text)  # JSON
-    source_id: Mapped[int | None] = mapped_column(ForeignKey("experience_sources.id"))
-    verification_status: Mapped[str] = mapped_column(String(30), default="UNVERIFIED")
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("experience_sources.id", name="fk_facts_source")
+    )
+    source_locator: Mapped[str | None] = mapped_column(Text)
+    verification_status: Mapped[str] = mapped_column(
+        String(30), default="UNVERIFIED", index=True
+    )
     confidence: Mapped[float] = mapped_column(default=0.0)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
     version: Mapped[int] = mapped_column(Integer, default=1)
-    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class ExperienceSource(Base, TimestampMixin):
     __tablename__ = "experience_sources"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
-    source_type: Mapped[str] = mapped_column(String(50))  # pdf | reactive_resume | manual
+    source_type: Mapped[str] = mapped_column(String(50), index=True)  # pdf | reactive_resume | manual | user_confirmed
     locator: Mapped[str | None] = mapped_column(Text)
     evidence: Mapped[str | None] = mapped_column(Text)
+    file_name: Mapped[str | None] = mapped_column(String(300))
+    file_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text)
 
 
 class ExperienceVersion(Base, TimestampMixin):
     __tablename__ = "experience_versions"
+    __table_args__ = (UniqueConstraint("experience_id", "version", name="uq_exp_version"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    experience_id: Mapped[int] = mapped_column(ForeignKey("experiences.id", ondelete="CASCADE"))
+    experience_id: Mapped[int] = mapped_column(
+        ForeignKey("experiences.id", ondelete="CASCADE"), index=True
+    )
     version: Mapped[int] = mapped_column(Integer)
-    snapshot: Mapped[str] = mapped_column(Text)  # JSON
+    event_type: Mapped[str] = mapped_column(String(40), default="UPDATE", server_default="UPDATE")
+    snapshot: Mapped[str] = mapped_column(Text)  # JSON: experience + all facts
     change_note: Mapped[str | None] = mapped_column(Text)
+
+
+class ResumeImport(Base, TimestampMixin):
+    __tablename__ = "resume_imports"
+    __table_args__ = (UniqueConstraint("user_id", "file_sha256", name="uq_resume_import_hash"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), index=True)
+    file_name: Mapped[str] = mapped_column(String(300))
+    file_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    text_sha256: Mapped[str | None] = mapped_column(String(64))
+    parser: Mapped[str] = mapped_column(String(80), default="deterministic_v1")
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", index=True)
+    candidate_payload: Mapped[str | None] = mapped_column(Text)  # JSON
+    error_message: Mapped[str | None] = mapped_column(Text)
 
 
 # --------------------------------------------------------------------------

@@ -15,6 +15,37 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 
+# Single source of truth for what this release actually implements. Config keys
+# may exist for future phases; they must never be presented as working features.
+CAPABILITY_STATUS: dict[str, str] = {
+    "discovery.greenhouse": "implemented",
+    "discovery.lever": "implemented",
+    "discovery.ashby": "implemented",
+    "discovery.official_careers": "not_implemented",
+    "discovery.search_engine": "not_implemented",
+    "discovery.xiaohongshu_public": "not_implemented",
+    "discovery.auto_expand_companies": "not_implemented",
+    "profile.pdf_import": "implemented",
+    "profile.manual_updates": "implemented",
+    "profile.fact_provenance": "implemented",
+    "profile.fact_verification": "implemented",
+    "profile.fact_retrieval": "implemented",
+    "resume.plan_generation": "implemented",
+    "resume.reactive_resume_render": "not_implemented",
+    "applications.auto_prepare": "not_implemented",
+    "applications.auto_send": "not_implemented",
+    "email.sync": "not_implemented",
+    "email.auto_reply": "not_implemented",
+    "models.host_or_standalone_calls": "not_implemented",
+    "notifications": "not_implemented",
+    "reports": "not_implemented",
+}
+
+
+def unimplemented_capabilities() -> list[str]:
+    return sorted(k for k, v in CAPABILITY_STATUS.items() if v == "not_implemented")
+
+
 class AppConfig(BaseModel):
     name: str = "OfferBomber"
     mode: str = "personal"
