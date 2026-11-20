@@ -51,6 +51,58 @@ class SmartResumePlanner:
         self.provider = provider
         self.sessions = sessions
 
+    @staticmethod
+    def _trusted_skills(confirmed: list[FactMatch]) -> set[str]:
+        """Skills with real evidence: tags on confirmed facts.
+
+        The model may select/rank from this set but may never introduce a skill
+        with no confirmed-fact backing. Profile.summary is free text and is
+        intentionally NOT parsed into skills (that would be guessing).
+        """
+        trusted: set[str] = set()
+        for fact in confirmed:
+            for skill in fact.skills:
+                if skill and skill.strip():
+                    trusted.add(skill.strip())
+        return trusted
+
+    def _filter_highlight_skills(
+        self, requested: list[str], trusted: set[str]
+    ) -> tuple[list[str], list[str]]:
+        """Keep only model-requested skills present in the trusted set.
+
+        Matching is case-insensitive; the canonical spelling from the trusted
+        set is used so the model cannot smuggle in a differently-cased fake.
+        """
+        canonical = {s.casefold(): s for s in trusted}
+        accepted: list[str] = []
+        rejected: list[str] = []
+        for skill in requested:
+            name = skill.strip() if isinstance(skill, str) else ""
+            if not name:
+                continue
+            real = canonical.get(name.casefold())
+            if real is None:
+                rejected.append(name)
+            elif real not in accepted:
+                accepted.append(real)
+        return accepted, rejected
+
+    @staticmethod
+    def _target_position(
+        requirements: JobRequirements | None, profile: Profile | None
+    ) -> str:
+        """Resolve the target position without ever using a language code.
+
+        Priority: original posting title -> profile's configured default -> "".
+        `resume_language` and `job_category` are classifications, not job titles.
+        """
+        if requirements and requirements.job_title and requirements.job_title.strip():
+            return requirements.job_title.strip()
+        if profile and profile.target_position and profile.target_position.strip():
+            return profile.target_position.strip()
+        return ""
+
     def _provenance(self, fact_ids: list[int]) -> dict[int, tuple[int, int | None]]:
         """Return fact_id -> (version, source_id) from authoritative DB rows."""
         if not self.sessions or not fact_ids:
@@ -112,7 +164,7 @@ class SmartResumePlanner:
             warnings.append("unconfirmed facts excluded from planning")
         if not confirmed:
             return ResumePlan(
-                target_position=requirements.job_category if requirements else "",
+                target_position=self._target_position(requirements, profile),
                 language=language,
                 target_page_count=target_page_count,
                 warnings=warnings + ["no confirmed facts; nothing planned"],
@@ -183,6 +235,10 @@ class SmartResumePlanner:
         sections: list[ResumeSection] = []
         used_fact_ids: list[int] = []
         all_warnings = list(warnings)
+        # Single source of truth for the text actually placed in the resume body.
+        # FactAudit (and therefore fact_snapshot) MUST reuse this exact value,
+        # including when a model rewrite was rejected and reverted to the original.
+        final_text_by_fact: dict[int, str] = {}
         for exp_id, group in sorted(sections_by_exp.items(), key=sort_key):
             section = ResumeSection(title=group[0].experience_title)
             for match in group:
@@ -191,6 +247,7 @@ class SmartResumePlanner:
                 if issue:
                     all_warnings.append(f"fact {match.fact_id}: {issue}; used original text")
                     rendered = match.fact_content
+                final_text_by_fact[match.fact_id] = rendered
                 section.items.append(
                     ResumeSectionItem(
                         experience_id=match.experience_id,
@@ -207,6 +264,16 @@ class SmartResumePlanner:
             if section.items:
                 sections.append(section)
 
+        # Model may only rank skills that have confirmed-fact evidence.
+        trusted = self._trusted_skills(confirmed)
+        highlights, rejected_skills = self._filter_highlight_skills(
+            decision.highlight_skills, trusted
+        )
+        if rejected_skills:
+            all_warnings.append(
+                "discarded unverifiable model skills: " + ", ".join(rejected_skills[:10])
+            )
+
         provenance = self._provenance(used_fact_ids)
         fact_audit: list[FactAudit] = []
         for fid in used_fact_ids:
@@ -218,17 +285,14 @@ class SmartResumePlanner:
                     fact_version=version,
                     source_id=source_id,
                     original_text=fact.fact_content,
-                    rendered_text=rendered_map.get(fid, fact.fact_content),
+                    rendered_text=final_text_by_fact.get(fid, fact.fact_content),
                     experience_id=fact.experience_id,
                 )
             )
 
         return ResumePlan(
             job_id=str(requirements.job_id) if requirements and requirements.job_id is not None else None,
-            target_position=(
-                profile.target_position if profile and profile.target_position
-                else (requirements.resume_language if requirements else "")
-            ),
+            target_position=self._target_position(requirements, profile),
             selected_experience_ids=list(sections_by_exp.keys()),
             selected_fact_ids=used_fact_ids,
             section_order=decision.section_order or [s.title for s in sections],
@@ -237,7 +301,7 @@ class SmartResumePlanner:
             sections=sections,
             warnings=all_warnings,
             fact_audit=fact_audit,
-            highlight_skills=decision.highlight_skills[:20],
+            highlight_skills=highlights[:20],
             generation_provider=f"model:{self.provider.name}",
         )
 

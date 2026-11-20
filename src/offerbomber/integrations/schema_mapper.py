@@ -67,6 +67,57 @@ def _is_present(value: str | None) -> bool:
     return bool(value and re.search(r"至今|present|now|current", str(value), re.I))
 
 
+# Publication status must never be upgraded. Ordered from weakest to strongest.
+_SUBMITTED_RE = re.compile(r"投稿|在审|under review|submitted|preprint|预投|in submission", re.I)
+_ACCEPTED_RE = re.compile(r"已录用|accepted|录用通知", re.I)
+_PUBLISHED_RE = re.compile(r"已发表|published|正式发表", re.I)
+
+
+def _publication_status(text: str) -> str:
+    """Classify a paper's real status from its confirmed fact text.
+
+    Returns one of SUBMITTED / ACCEPTED / PUBLISHED / UNKNOWN. Never infers
+    PUBLISHED from a mere submission; unknown stays unknown.
+    """
+    if _PUBLISHED_RE.search(text):
+        return "PUBLISHED"
+    if _ACCEPTED_RE.search(text):
+        return "ACCEPTED"
+    if _SUBMITTED_RE.search(text):
+        return "SUBMITTED"
+    return "UNKNOWN"
+
+
+_STATUS_LABELS = {
+    "PUBLISHED": "Published",
+    "ACCEPTED": "Accepted (not yet published)",
+    "SUBMITTED": "Submitted / under review",
+    "UNKNOWN": "Publication status not confirmed",
+}
+
+
+def _safe_skills(
+    plan: ResumePlan, highlight_skills: list[str]
+) -> list[str]:
+    """Skills actually evidenced by planned fact items.
+
+    The last line of defence: even if a model injected a skill into
+    plan.highlight_skills, it cannot appear in the PDF unless it also appears
+    in a confirmed fact item that made it into the plan. Ordering follows the
+    model's ranking for evidenced skills, then the rest deterministically.
+    """
+    evidenced = {
+        skill.strip()
+        for section in plan.sections
+        for item in section.items
+        for skill in item.skills
+        if skill and skill.strip()
+    }
+    ordered = [s for s in highlight_skills if s in evidenced]
+    ordered.extend(sorted(s for s in evidenced if s not in ordered))
+    return ordered[:40]
+
+
 def _dates(start: str | None, end: str | None) -> dict[str, Any]:
     norm_start = _normalize_date(start)
     norm_end = _normalize_date(end)
@@ -152,14 +203,19 @@ def map_resume_data(
         experience = experiences.get(exp_id)
         bullets = "".join(f"<li>{html.escape(item.text)}</li>" for item in items)
         description = f"<ul>{bullets}</ul>" if bullets else ""
+        # Classification by the authoritative Experience.type. RESEARCH is a
+        # research project, NOT a publication; only PAPER goes to publications,
+        # and even then the real status is preserved in the description.
         target_section = "projects"
         if experience:
             if experience.type in {"WORK", "INTERNSHIP"}:
                 target_section = "experience"
-            elif experience.type in {"PAPER", "RESEARCH"}:
+            elif experience.type == "PAPER":
                 target_section = "publications"
             elif experience.type in {"COMPETITION", "AWARD"}:
                 target_section = "awards"
+            elif experience.type == "RESEARCH":
+                target_section = "projects"
         item: dict[str, Any] = {
             "id": _uid(),
             "hidden": False,
@@ -182,6 +238,16 @@ def map_resume_data(
                 "roles": [],
             })
         elif target_section == "publications":
+            # Never let a PAPER item imply publication. Prefix the real status
+            # so a submission stays visibly "Submitted / under review" and an
+            # unconfirmed status stays "not confirmed", never "Published".
+            status_text = " ".join(item_text.text for item_text in items)
+            status = _publication_status(status_text)
+            status_label = _STATUS_LABELS[status]
+            item["description"] = (
+                f"<p><strong>Publication status: {html.escape(status_label)}</strong></p>"
+                + description
+            )
             item.update({
                 "title": (experience.title if experience else None) or "",
                 "publisher": (experience.organization if experience else None) or "",
@@ -209,10 +275,7 @@ def map_resume_data(
             })
         sections[target_section]["items"].append(item)
 
-    skills = sorted(
-        {skill for section in plan.sections for item in section.items for skill in item.skills}
-        | set(plan.highlight_skills)
-    )
+    skills = _safe_skills(plan, list(plan.highlight_skills))
     if skills:
         sections["skills"]["items"].append(
             {

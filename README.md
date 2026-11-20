@@ -4,12 +4,26 @@ Local-first personal job-hunting automation system. Phase 1 (discovery), Phase 2
 
 ## Status
 
-| Phase | Scope | Status |
-|---|---|---|
-| 1 | Config, SQLite, Greenhouse/Lever/Ashby, dedup, filters, CLI | **Implemented & verified** |
-| 2 | PDF import, experience/fact KB, versioning, provenance, FTS5 retrieval, ResumePlan | **Implemented & verified** |
-| 3 | ModelProvider, host adapters, model parsing, JD analysis, reranking, smart planning, Reactive Resume adapter, PDF validation | **Implemented; adapters not live-verified (need credentials)** |
-| 4-7 | Email, applications, feedback, MCP, scheduler | Not implemented (no fake stubs) |
+| Capability | Status |
+|---|---|
+| Job discovery (Greenhouse / Lever / Ashby) | **Implemented & verified** |
+| Personal experience knowledge base (facts, provenance, versioning, FTS5) | **Implemented & verified** |
+| Intelligent resume planning (audit/skill/classification hardening in 3.2) | **Implemented & verified** |
+| Reactive Resume (clone → fill → PDF → validation) | **Implemented & live-verified with a real key** |
+| WorkBuddy model adapter | Adapter implemented; **not live-verified** (needs credentials) |
+| DeepSeek Harness model adapter | Adapter implemented; **not live-verified** (needs `dsh` runtime) |
+| Automatic job application sending | Not implemented |
+| Email management / sync | Not implemented |
+| MCP Server (12 tools, stdio) | **Implemented & verified** at MCP protocol level; host integration pending |
+| Scheduler | Not implemented |
+
+See `CAPABILITY_STATUS` for the authoritative, machine-readable status list.
+
+Host-orchestrated mode: WorkBuddy and DeepSeek Harness use their own models and call
+OfferBomber over MCP — no model API key needed. See `docs/MCP_INTEGRATION.md` and
+`src/offerbomber/integrations/mcp/server.py`. The server is verified at the real MCP
+protocol level (stdio handshake + tools/list + tools/call); WorkBuddy/dsh host-side
+integration still needs to be performed in the user's environment.
 
 `offerbomber model doctor` and `offerbomber resume generate` report the exact live status. Mock results are never presented as real model calls or real PDF generation.
 
@@ -100,13 +114,15 @@ Every command accepts `--config PATH`. See `examples/README.md` for an end-to-en
 | `mock` | deterministic offline | test/demo only, never real |
 | `workbuddy` | `POST/GET /openapi/v2/tasks` + ACP SSE/JSON-RPC (`open.workbuddy.cn/docs/openapi`); no OpenAI-compatible endpoint | adapter implemented, **not live-verified** (needs `OFFERBOMBER_WORKBUDDY_TOKEN`) |
 | `deepseek_harness` | `dsh --profile headless [--json] [--session-id]` (`deepseek-ai/deepseek-harness` official CLI help) | adapter implemented, **not live-verified** (needs `dsh` on PATH) |
-| `openai_compatible` | generic `/chat/completions` for user-supplied endpoint | optional, off by default |
+| `openai_compatible` | generic `/chat/completions` for user-supplied endpoint | **live-verified** with a real DeepSeek key (2026-11-20): real structured `JOB_ANALYSIS` output passed Pydantic validation and analyzer invariants; off by default |
 
 Task types: `RESUME_EXTRACTION`, `JOB_ANALYSIS`, `EXPERIENCE_RERANKING`, `RESUME_PLANNING`, `RESUME_REWRITING`, `FACT_CONSISTENCY_CHECK`. All calls are async, Pydantic-validated, timed out, cancellable, classified, bounded-retry and logged; failures fall back safely.
 
 ## Reactive Resume (verified interface, 2026-11-19)
 
-Adapter uses the official `/api/openapi` REST API with `x-api-key` auth: list/get resumes, `POST /resumes/{id}/copies` (clone; the primary resume is **never** edited), update content while preserving metadata/design/template, `GET /resumes/{id}/pdf`, PyMuPDF validation. No key → explicit failure, no fake PDF. Rate limits (1000/h per key, 5 PDF/min per resume) and errors (`code` field, 429) are handled. **Not live-verified** without `OFFERBOMBER_RXRESUME_API_KEY`.
+Adapter uses the official `/api/openapi` REST API with `x-api-key` auth: list/get resumes, `POST /resumes/{id}/copies` (clone; the primary resume is **never** edited), update content while preserving metadata/design/template, `GET /resumes/{id}/pdf`, PyMuPDF validation. No key → explicit failure, no fake PDF. Rate limits and errors (`code` field, 429) are handled. `health_check` now verifies the key with an authenticated `GET /resumes` (distinguishes unavailable / auth failure / rate limit / transport / ok) and honours a custom `OFFERBOMBER_RXRESUME_URL`.
+
+**Live status:** the full clone → fill → export → validate loop was verified against the real service with a real key (2026-11-20): a PDF was produced and passed all automated checks. Model-layer planning in that run used the deterministic provider (no host-model credentials were available); it is not a real model call.
 
 ## Data sources (verified 2026-11-19)
 
@@ -143,16 +159,16 @@ The full 25-table task-book schema plus `resume_imports` and the FTS5 virtual ta
 ## Tests
 
 ```bash
-PYTHONPATH=src pytest tests/ -q        # 76 passed
+PYTHONPATH=src pytest tests/ -q        # 93 passed
 ```
 
-Coverage includes Chinese dedup, malformed source isolation, single-record isolation, PDF extraction, duplicate PDF import, full experience creation, fact addition, version history, archive/restore, Chinese and English retrieval, requirement ranking, unconfirmed-fact exclusion, snapshot immutability, restart persistence, a fresh Alembic upgrade, FTS/revision consistency and atomic rollback on index failure (Phase 3 Part A), all model failure classes and safety guards, model parsing truthfulness, JD evidence separation, reranking ID validation, smart-planning budget/provenance, Reactive Resume mapping/validation/mock-HTTP flow, and four end-to-end scenarios (ML job, quant job, submission-not-accepted, service failure).
+Coverage includes Chinese dedup, malformed source isolation, single-record isolation, PDF extraction, duplicate PDF import, full experience creation, fact addition, version history, archive/restore, Chinese and English retrieval, requirement ranking, unconfirmed-fact exclusion, snapshot immutability, restart persistence, a fresh Alembic upgrade, FTS/revision consistency and atomic rollback on index failure (Phase 3 Part A), all model failure classes and safety guards, model parsing truthfulness, JD evidence separation, reranking ID validation, smart-planning budget/provenance, Reactive Resume mapping/validation/mock-HTTP flow, four end-to-end scenarios (ML job, quant job, submission-not-accepted, service failure), and the Phase 3.2 hardening suite (`test_phase32_hardening.py`): FactAudit/body/snapshot text identity on rejected rewrites, untrusted-skill rejection, research-vs-publication classification, publication-status preservation, target-position resolution, and authenticated health-check codes (ok/401/429/503/timeout/no-key).
 
 ## Known limitations
 
 - Scanned-PDF OCR is not available; the model parser explicitly reports unusable text instead of pretending success. Complex two-column reading order needs manual review.
 - `official_careers`, `search_engine`, `xiaohongshu_public` and `auto_expand_companies` are configuration placeholders only.
-- Model host adapters are implemented against documented interfaces but **not live-verified** in this environment (no credentials). Without credentials, `auto` uses Mock and says so.
+- WorkBuddy and DeepSeek Harness adapters are implemented against documented interfaces but **not live-verified** (no credentials/runtime here). The optional `openai_compatible` adapter was live-verified with a real DeepSeek key (2026-11-20) for structured JD analysis; it is off by default. Without any configured real provider, `auto` uses Mock and says so.
 - Reactive Resume generation requires a real API key and a source resume id; automated PDF checks cannot certify visual layout — human preview is required.
 - Email, applications, reports, MCP server and scheduling are not implemented in this release.
 - Recruitment email extraction is not implemented; `apply_method` stays `official_form`/`unknown`.

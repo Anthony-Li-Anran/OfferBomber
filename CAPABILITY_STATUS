@@ -1,0 +1,59 @@
+OfferBomber capability status
+=============================
+Updated: 2026-11-20
+Phase: 3.2 (production hardening)
+
+This is the authoritative, human-readable status list. It intentionally
+understates rather than overstates capabilities. "Adapter implemented" is NOT
+the same as "live-verified". Mock results are never reported as real calls.
+
+CAPABILITY                              STATUS
+--------------------------------------  ------------------------------------
+Job discovery (Greenhouse/Lever/Ashby)  IMPLEMENTED & VERIFIED (real APIs)
+Personal experience knowledge base      IMPLEMENTED & VERIFIED
+  - fact-level storage + provenance     IMPLEMENTED & VERIFIED
+  - versioning / immutable snapshots    IMPLEMENTED & VERIFIED
+  - FTS5 retrieval                      IMPLEMENTED & VERIFIED
+Intelligent resume planning             IMPLEMENTED & VERIFIED
+  - audit/body/snapshot text identity   IMPLEMENTED (Phase 3.2)
+  - untrusted-skill rejection           IMPLEMENTED (Phase 3.2)
+  - research vs publication split       IMPLEMENTED (Phase 3.2)
+  - publication-status preservation     IMPLEMENTED (Phase 3.2)
+  - target-position resolution          IMPLEMENTED (Phase 3.2)
+Reactive Resume adapter                 IMPLEMENTED & LIVE-VERIFIED (real key)
+  - clone -> fill -> export -> validate LIVE-VERIFIED 2026-11-20
+  - authenticated health check          IMPLEMENTED (Phase 3.2, mock-tested)
+  - custom base_url                     IMPLEMENTED
+WorkBuddy model adapter                 ADAPTER IMPLEMENTED; NOT LIVE-VERIFIED
+DeepSeek Harness adapter                ADAPTER IMPLEMENTED; NOT LIVE-VERIFIED
+OpenAI-compatible adapter               LIVE-VERIFIED with real DeepSeek key (2026-11-20)
+  - structured JOB_ANALYSIS call        LIVE-VERIFIED (real model output, Pydantic-valid)
+  - analyzer invariants (title/id/lang) LIVE-VERIFIED (authoritative fields enforced)
+MCP Server (host-orchestrated mode)     IMPLEMENTED & VERIFIED at protocol level
+  - 12 tools, stdio transport           LIVE-VERIFIED (real MCP handshake/list/call)
+  - host reasoning, L2 write guards     IMPLEMENTED (prepare->confirm->write, single-use token)
+  - WorkBuddy / DeepSeek Harness host   NOT LIVE-VERIFIED (host-side registration pending)
+Automatic job application sending       NOT IMPLEMENTED
+Email management / sync                 NOT IMPLEMENTED
+MCP Server                              NOT IMPLEMENTED
+Scheduler                               NOT IMPLEMENTED
+
+Verification legend
+-------------------
+IMPLEMENTED & VERIFIED      tested locally, including real external calls where noted
+LIVE-VERIFIED               exercised against the real external service with a real credential
+ADAPTER IMPLEMENTED         code follows the documented interface; no live credential was used
+NOT IMPLEMENTED             no working feature; later-phase placeholder only
+
+Notes
+-----
+- The 2026-11-20 Reactive Resume live run used the deterministic planner for the
+  model layer (no host-model credentials were available), not a real model call.
+- On 2026-11-20 a real DeepSeek key (user-supplied, env vars only) verified the
+  OpenAI-compatible adapter end-to-end: real /chat/completions -> Pydantic-valid
+  JobRequirements -> analyzer invariants. WorkBuddy and DeepSeek Harness remain
+  NOT live-verified; that run did not exercise them.
+- The credential used was never written to disk or committed; only env vars were set.
+- No real API key, token, personal resume, or PII is stored in this repository.
+- Credentials are read from environment variables or OS keyring only.
+- Run `offerbomber model doctor` and `offerbomber status` for CLI-reported status.

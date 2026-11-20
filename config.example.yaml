@@ -48,8 +48,10 @@ profile:
   require_fact_verification: true
 
 resume:
-  # ResumePlan is implemented; Reactive Resume adapter requires a real API key
-  # (OFFERBOMBER_RXRESUME_API_KEY) — without it, generation fails explicitly.
+  # ResumePlan is implemented; Reactive Resume adapter is live-verified with a
+  # real key. Set OFFERBOMBER_RXRESUME_API_KEY (and optionally
+  # OFFERBOMBER_RXRESUME_URL) via env — never in this file. Without a key,
+  # health_check reports unavailable and generation fails explicitly.
   provider: reactive_resume
   tailor_per_job: true
   preserve_original: true

@@ -34,6 +34,27 @@ from .schema_mapper import map_resume_data
 
 log = structlog.get_logger("reactive_resume")
 
+# Credentials are resolved in this order: explicit argument > environment > a
+# user-level file outside the git repo. The file lives under ~/.offerbomber so
+# it can never be committed; env remains the documented override.
+CREDENTIALS_FILENAME = "credentials.json"
+
+
+def local_credentials_path() -> Path:
+    """Path to the user-level credentials file (never inside the project repo)."""
+    return Path.home() / ".offerbomber" / CREDENTIALS_FILENAME
+
+
+def read_local_credential(field: str) -> str:
+    """Read one credential field from the local file; return "" when absent."""
+    try:
+        raw = local_credentials_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return ""
+    value = data.get(field, "")
+    return value.strip() if isinstance(value, str) else ""
+
 
 class ResumeGenerationError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
@@ -59,8 +80,20 @@ class ReactiveResumeProvider:
         base_url: str | None = None,
         timeout: float = 30.0,
     ) -> None:
-        self.api_key = api_key or os.getenv("OFFERBOMBER_RXRESUME_API_KEY", "")
-        self.base_url = (base_url or os.getenv("OFFERBOMBER_RXRESUME_URL", "https://rxresu.me/api/openapi")).rstrip("/")
+        # An explicit argument (even "") wins; fallback only when omitted.
+        self.api_key = (
+            api_key
+            if api_key is not None
+            else os.getenv("OFFERBOMBER_RXRESUME_API_KEY", "")
+            or read_local_credential("rxresume_api_key")
+        )
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else os.getenv("OFFERBOMBER_RXRESUME_URL", "")
+            or read_local_credential("rxresume_url")
+            or "https://rxresu.me/api/openapi"
+        ).rstrip("/")
         self.timeout = timeout
 
     @property
@@ -72,16 +105,62 @@ class ReactiveResumeProvider:
             raise ResumeGenerationError("unavailable", "Reactive Resume API key not configured")
         return {"x-api-key": self.api_key, "Accept": "application/json"}
 
+    def _public_health_url(self) -> str:
+        """Derive the public health endpoint from base_url (no hard-coded host).
+
+        https://rxresu.me/api/openapi -> https://rxresu.me/api/health
+        """
+        return re.sub(r"/openapi/?$", "/health", self.base_url)
+
     async def health_check(self) -> dict[str, Any]:
+        """Check service health AND verify the API key with an authenticated call.
+
+        Codes: ok | unavailable (no key) | service_unavailable | auth_failed |
+        rate_limited | transport | unexpected_response. The key is never logged
+        nor echoed in the detail string.
+        """
         if not self.configured:
             return {"available": False, "code": "unavailable", "detail": "OFFERBOMBER_RXRESUME_API_KEY not set"}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get("https://rxresu.me/api/health")
-                response.raise_for_status()
-            return {"available": True, "code": "ok", "detail": "rxresu.me health endpoint reachable"}
-        except httpx.HTTPError as exc:
-            return {"available": False, "code": "transport", "detail": str(exc)}
+                # 1. Public health (no key) — proves the service is reachable.
+                try:
+                    health_response = await client.get(self._public_health_url())
+                    health_response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    return {
+                        "available": False, "code": "service_unavailable",
+                        "detail": f"health endpoint returned HTTP {health_response.status_code}",
+                    }
+                # 2. Authenticated call — proves the KEY is actually valid.
+                try:
+                    auth_response = await client.get(
+                        f"{self.base_url}/resumes", headers=self._headers()
+                    )
+                except httpx.HTTPError:
+                    return {"available": False, "code": "transport", "detail": "authenticated request failed"}
+                if auth_response.status_code in (401, 403):
+                    return {"available": False, "code": "auth_failed", "detail": "API key rejected (401/403)"}
+                if auth_response.status_code == 429:
+                    return {"available": False, "code": "rate_limited", "detail": "API key rate limited (429)"}
+                if auth_response.status_code >= 400:
+                    return {
+                        "available": False, "code": "auth_failed",
+                        "detail": f"authenticated request returned HTTP {auth_response.status_code}",
+                    }
+                try:
+                    payload = auth_response.json()
+                except ValueError:
+                    return {"available": False, "code": "unexpected_response", "detail": "resumes response is not JSON"}
+                if not isinstance(payload, list):
+                    return {"available": False, "code": "unexpected_response", "detail": "resumes response is not a list"}
+            return {
+                "available": True, "code": "ok",
+                "detail": "service healthy and API key accepted",
+                "resume_count": len(payload),
+            }
+        except httpx.HTTPError:
+            return {"available": False, "code": "transport", "detail": "public health endpoint unreachable"}
 
     @staticmethod
     def _raise_for_response(response: httpx.Response) -> None:

@@ -11,3 +11,4 @@ build/
 .workbuddy/
 config.yaml
 /output/
+*.genie

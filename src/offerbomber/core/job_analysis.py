@@ -23,6 +23,9 @@ class Requirement(BaseModel):
 
 class JobRequirements(BaseModel):
     job_id: int | None = None
+    # Original posting title, copied verbatim from the source Job by the analyzer.
+    # Never inferred from the model or from resume_language.
+    job_title: str = ""
     job_category: str = "UNKNOWN"
     seniority: str = "UNKNOWN"
     required_skills: list[Requirement] = Field(default_factory=list)
@@ -50,6 +53,7 @@ class DeterministicJobAnalyzer:
                 keywords.append(token)
         return JobRequirements(
             job_id=job.id,
+            job_title=job.title or "",
             required_skills=[Requirement(text=k, evidence=k, level="UNKNOWN") for k in keywords[:15]],
             important_keywords=keywords[:20],
             education_requirements=(
@@ -109,8 +113,10 @@ class JobAnalyzer:
             result.warnings.append("model analysis failed; deterministic fallback used")
             return result
 
-        # Enforce invariants regardless of provider behaviour.
+        # Enforce invariants regardless of provider behaviour. The title comes
+        # from the authoritative Job row, never from model output.
         result.job_id = job.id
+        result.job_title = job.title or ""
         result.analysis_provider = self.provider.name
         result.evidence_available = bool(text.strip())
         for group in (
