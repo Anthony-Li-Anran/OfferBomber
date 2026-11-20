@@ -44,10 +44,13 @@ search_app = typer.Typer(help="Search the experience knowledge base")
 resume_app = typer.Typer(help="Resume planning, generation and versions")
 model_app = typer.Typer(help="Model provider diagnostics")
 mcp_app = typer.Typer(help="Human approval of pending MCP write operations")
+campaign_app = typer.Typer(help="General-purpose job-search campaigns (Phase 4-6)")
+agent_app = typer.Typer(help="Matching, applications, feedback and daily reports")
 for sub_app, name in (
     (jobs_app, "jobs"), (profile_app, "profile"), (experience_app, "experience"),
     (fact_app, "fact"), (search_app, "search"), (resume_app, "resume"),
-    (model_app, "model"), (mcp_app, "mcp"),
+    (model_app, "model"), (mcp_app, "mcp"), (campaign_app, "campaign"),
+    (agent_app, "agent"),
 ):
     app.add_typer(sub_app, name=name)
 
@@ -959,4 +962,127 @@ def status(config: Path = typer.Option(None, "--config")) -> None:
     typer.echo("not implemented (configuration placeholders or later phases):")
     for capability in unimplemented_capabilities():
         typer.echo(f"  - {capability}")
+    ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4-6: general-purpose job-search agent CLI
+# ---------------------------------------------------------------------------
+
+
+def _empty_profile_template() -> dict:
+    """A blank campaign: no constraints. Nothing is inferred or hardcoded."""
+    from .search_profile import JobSearchProfile
+
+    return JobSearchProfile().model_dump(mode="json")
+
+
+@campaign_app.command("template")
+def campaign_template() -> None:
+    """Print a blank JobSearchProfile JSON template (all fields optional)."""
+    _echo_json(_empty_profile_template())
+
+
+@campaign_app.command("create")
+def campaign_create(
+    name: str = typer.Option(..., "--name"),
+    criteria_file: Path = typer.Option(..., "--file", help="Path to JobSearchProfile JSON"),
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Create a job-search campaign from a JSON criteria file."""
+    from .search_profile import JobSearchProfile, SearchProfileService
+
+    ctx = _require_config(config)
+    try:
+        profile = JobSearchProfile.model_validate_json(criteria_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(f"invalid criteria file: {exc}")
+    profile.name = name
+    profile.user_id = user
+    try:
+        created = SearchProfileService(ctx.sessions).create(profile)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
+    _echo_json({"name": created.name, "user_id": created.user_id, "created": True})
+    ctx.close()
+
+
+@campaign_app.command("list")
+def campaign_list(
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """List all campaigns for a user."""
+    from .search_profile import SearchProfileService
+
+    ctx = _require_config(config)
+    rows = SearchProfileService(ctx.sessions).list(user)
+    _echo_json([{"id": pid, "name": p.name} for pid, p in rows])
+    ctx.close()
+
+
+@agent_app.command("match")
+def agent_match(
+    profile_id: int = typer.Option(..., "--profile"),
+    limit: int = typer.Option(20, "--limit"),
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Match collected jobs against a campaign using confirmed facts only."""
+    from .app import AppContext
+    from .integrations.mcp.toolkit import McpToolkit
+
+    ctx = _require_config(config)
+    toolkit = McpToolkit(ctx, user_id=user)
+    toolkit.ctx.settings = ctx.settings
+    _echo_json(toolkit.match_jobs(profile_id, limit=limit))
+    ctx.close()
+
+
+@agent_app.command("report")
+def agent_report(
+    days: int = typer.Option(1, "--days"),
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Generate the daily report (Markdown + JSON) into output/reports."""
+    from .reporting.daily import DailyReport
+
+    ctx = _require_config(config)
+    out = Path(ctx.settings.storage.db_path).parent.parent / "output" / "reports"
+    _echo_json(DailyReport(ctx.sessions, user_id=user).save(out, days=days))
+    ctx.close()
+
+
+@agent_app.command("pause")
+def agent_pause(
+    resume: bool = typer.Option(False, "--resume", help="Resume instead of pause"),
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Pause (default) or resume all automation for a user."""
+    from .applications.pipeline import ApplicationPipeline
+    from .integrations.mcp.confirmations import ConfirmationStore
+    from .integrations.mcp.toolkit import McpToolkit
+
+    ctx = _require_config(config)
+    store = ConfirmationStore(Path(resolve_db_path(ctx.settings)), session_factory=ctx.sessions)
+    pipeline = ApplicationPipeline(ctx.sessions, store, user_id=user)
+    _echo_json(pipeline.pause(paused=not resume))
+    ctx.close()
+
+
+@agent_app.command("status")
+def agent_status(
+    user: str = typer.Option("default", "--user"),
+    config: Path = typer.Option(None, "--config"),
+) -> None:
+    """Show automation mode, daily caps and application states."""
+    from .applications.pipeline import ApplicationPipeline
+    from .integrations.mcp.confirmations import ConfirmationStore
+
+    ctx = _require_config(config)
+    store = ConfirmationStore(Path(resolve_db_path(ctx.settings)), session_factory=ctx.sessions)
+    _echo_json(ApplicationPipeline(ctx.sessions, store, user_id=user).status())
     ctx.close()

@@ -45,12 +45,17 @@ class HttpFetcher:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def get_json(self, url: str, params: dict[str, str] | None = None) -> object:
+    async def get_json(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> object:
         """GET *url* and return decoded JSON. Raises SourceFetchError on failure."""
         last_error = ""
         for attempt in range(1, self._retry.max_attempts + 1):
             try:
-                response = await self._client.get(url, params=params)
+                response = await self._client.get(url, params=params, headers=headers)
                 if response.status_code in _RETRYABLE_STATUS:
                     last_error = f"HTTP {response.status_code} from {url}"
                 elif response.status_code >= 400:
@@ -67,6 +72,34 @@ class HttpFetcher:
             if attempt < self._retry.max_attempts:
                 await asyncio.sleep(self._backoff(attempt))
 
+        raise SourceFetchError(
+            f"failed after {self._retry.max_attempts} attempts for {url}: {last_error}"
+        )
+
+    async def get_text(self, url: str, params: dict[str, str] | None = None) -> str:
+        """GET *url* and return response text. Shares the bounded retry policy.
+
+        Accept header is temporarily text/html-capable so public careers pages
+        return HTML; JSON callers keep using get_json().
+        """
+        last_error = ""
+        for attempt in range(1, self._retry.max_attempts + 1):
+            try:
+                response = await self._client.get(
+                    url,
+                    params=params,
+                    headers={"Accept": "text/html,application/xhtml+xml,application/json"},
+                )
+                if response.status_code in _RETRYABLE_STATUS:
+                    last_error = f"HTTP {response.status_code} from {url}"
+                elif response.status_code >= 400:
+                    raise SourceFetchError(f"HTTP {response.status_code} from {url}")
+                else:
+                    return response.text
+            except httpx.HTTPError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < self._retry.max_attempts:
+                await asyncio.sleep(self._backoff(attempt))
         raise SourceFetchError(
             f"failed after {self._retry.max_attempts} attempts for {url}: {last_error}"
         )

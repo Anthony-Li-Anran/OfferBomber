@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...app import AppContext, resolve_db_path
@@ -44,7 +44,9 @@ from .authorization import (
 )
 from .confirmations import ConfirmationStore
 from ...integrations.reactive_resume import ReactiveResumeProvider
-from ...storage.models import Education, Experience, ExperienceFact, Job, Profile, ResumeVersion
+from ...storage.models import (
+    Education, EmailAccount, Experience, ExperienceFact, Job, Profile, ResumeVersion,
+)
 
 log = structlog.get_logger("mcp.toolkit")
 
@@ -103,6 +105,28 @@ class McpToolkit:
         # table is created idempotently on init.
         db_path = Path(resolve_db_path(ctx.settings))
         self._confirmations = ConfirmationStore(db_path, session_factory=ctx.sessions)
+        self._ensure_phase46_schema()
+
+    def _ensure_phase46_schema(self) -> None:
+        """Idempotently create Phase 4-6 tables for databases initialized before
+        these tables existed. CREATE TABLE IF NOT EXISTS never alters existing
+        data; Alembic remains the canonical migration path for schema changes.
+        """
+        from ...storage.models import (
+            ApplicationDraft, AutomationState, DiscoveryRun, EmailAccount,
+            EmailTemplate, SearchProfile,
+        )
+
+        with self.ctx.session() as session:
+            bind = session.get_bind()
+            for model in (
+                SearchProfile, EmailAccount, EmailTemplate, ApplicationDraft,
+                AutomationState, DiscoveryRun,
+            ):
+                try:
+                    model.__table__.create(bind=bind, checkfirst=True)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("schema_ensure_failed", table=model.__tablename__, error=str(exc))
 
     # ---------------- L0: discovery ----------------
 
@@ -746,3 +770,367 @@ class McpToolkit:
             "content": fact.content, "skills": McpToolkit._fact_skills(fact),
             "verification_status": fact.verification_status,
         }
+
+    # ====================================================================
+    # Phase 4-6: general-purpose job-hunting agent capabilities (L0/L1/L2)
+    # ====================================================================
+
+    # ---------- search profiles (L0 read / L1 write) ----------
+
+    def _profile_service(self):
+        from ...search_profile import SearchProfileService
+
+        return SearchProfileService(self.ctx.sessions)
+
+    def search_profiles(self) -> dict[str, Any]:
+        """[L0 只读] 列出当前用户的所有求职配置(多个求职活动)。"""
+        rows = self._profile_service().list(self.user_id)
+        return _ok({
+            "profiles": [
+                {"id": pid, "name": p.name, "criteria": json.loads(p.to_canonical_json())}
+                for pid, p in rows
+            ],
+            "count": len(rows),
+        })
+
+    def create_search_profile(self, criteria_json: str) -> dict[str, Any]:
+        """[L1 写入] 创建通用求职配置。所有偏好字段可空;未设置=不限制,不推断。"""
+        from ...search_profile import JobSearchProfile
+
+        try:
+            data = json.loads(criteria_json)
+            profile = JobSearchProfile.model_validate(data)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return _fail("invalid_criteria", str(exc))
+        profile.user_id = self.user_id
+        if not profile.name:
+            return _fail("name_required", "profile name is required")
+        created = self._profile_service().create(profile)
+        with self.ctx.session() as session:
+            from ...storage.models import SearchProfile
+
+            row = session.execute(
+                select(SearchProfile).where(
+                    SearchProfile.user_id == self.user_id, SearchProfile.name == created.name
+                )
+            ).scalars().first()
+            profile_id = row.id if row else None
+        return _ok({"profile_id": profile_id, "name": created.name})
+
+    def update_search_profile(self, profile_id: int, criteria_json: str) -> dict[str, Any]:
+        """[L1 写入] 更新当前用户自己的求职配置;不属于本人的 ID 被拒绝。"""
+        from ...search_profile import JobSearchProfile
+
+        try:
+            profile = JobSearchProfile.model_validate(json.loads(criteria_json))
+        except (json.JSONDecodeError, ValueError) as exc:
+            return _fail("invalid_criteria", str(exc))
+        profile.user_id = self.user_id
+        updated = self._profile_service().update(self.user_id, profile_id, profile)
+        if updated is None:
+            return _fail("profile_not_found", "profile not found or not owned by user")
+        return _ok({"profile_id": profile_id, "name": updated.name})
+
+    # ---------- company discovery (L1) ----------
+
+    def discover_companies(self, profile_id: int, max_companies: int = 20) -> dict[str, Any]:
+        """[L1 受控网络发现] 从求职配置生成查询,用已配置搜索源自动发现并验证企业招聘入口。不接受任意 URL。"""
+        from ...core.company_discovery import CompanyDiscoveryService
+        from ...discovery.http import HttpFetcher
+        from ...discovery.search_source import SearchProviderConfig
+
+        profile = self._profile_service().get(self.user_id, profile_id)
+        if profile is None:
+            return _fail("profile_not_found", "profile not found or not owned by user")
+        provider = self.ctx.settings.discovery.search_provider
+        if provider is None or not provider.base_url:
+            return _fail("search_provider_not_configured", "configure discovery.search_provider.base_url first")
+        config = SearchProviderConfig(
+            base_url=provider.base_url,
+            api_key_env=provider.api_key_env,
+            result_limit=provider.result_limit,
+        )
+        fetcher = HttpFetcher()
+        try:
+            service = CompanyDiscoveryService(fetcher, config)
+            result = _run_coroutine(
+                service.discover(profile, max_companies=max(1, min(max_companies, 100)))
+            )
+            return _ok(result.as_dict())
+        except Exception as exc:
+            return _fail("discovery_failed", f"{type(exc).__name__}: {exc}")
+        finally:
+            _run_coroutine(fetcher.aclose())
+
+    def import_jobs(self, file_path: str) -> dict[str, Any]:
+        """[L1 本地导入] 从用户提供的 CSV/JSON 文件导入岗位。不接受网络 URL。"""
+        from ...discovery.custom_source import LocalImportSource
+        from ...storage import repositories as repo
+        from ...core.dedup import JobDeduplicator
+
+        if not file_path:
+            return _fail("file_required", "file_path is required")
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            return _fail("file_not_found", "import file not found")
+        try:
+            jobs = LocalImportSource().load(path)
+        except Exception as exc:
+            return _fail("import_failed", f"{type(exc).__name__}: {exc}")
+        inserted = duplicates = 0
+        with self.ctx.session() as session:
+            dedup = JobDeduplicator(session)
+            for raw in jobs:
+                result = dedup.find(raw)
+                if result.job is not None:
+                    duplicates += 1
+                    continue
+                job = repo.insert_job(session, raw)
+                repo.add_source_record(session, job, raw)
+                dedup.add(job)
+                inserted += 1
+            session.commit()
+        return _ok({"discovered": len(jobs), "inserted": inserted, "duplicates": duplicates})
+
+    # ---------- generic matching (L0) ----------
+
+    def match_jobs(self, profile_id: int, job_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        """[L0 只读] 用当前用户的已确认事实,按求职配置对岗位通用匹配(无硬编码职业分类)。"""
+        from ...core.job_schema import NormalizedJob
+        from ...core.matching import FactView, JobMatcher
+        from ...storage.models import Job
+
+        profile = self._profile_service().get(self.user_id, profile_id)
+        if profile is None:
+            return _fail("profile_not_found", "profile not found or not owned by user")
+        # Only CONFIRMED, non-deleted facts of the current user (A1 invariant).
+        with self.ctx.session() as session:
+            from ...integrations.mcp.authorization import load_authorized_facts
+
+            fact_rows = session.execute(
+                select(ExperienceFact).where(
+                    ExperienceFact.verification_status == CONFIRMED,
+                    ExperienceFact.is_deleted.is_(False),
+                )
+            ).scalars().all()
+            owned: list[ExperienceFact] = []
+            for fact in fact_rows:
+                exp = session.get(Experience, fact.experience_id)
+                prof = session.get(Profile, exp.profile_id) if exp else None
+                if prof and prof.user_id == self.user_id:
+                    owned.append(fact)
+            facts = [FactView(f.id, f.content, self._fact_skills(f), f.version or 1) for f in owned]
+            stmt = select(Job)
+            if job_id is not None:
+                stmt = stmt.where(Job.id == job_id)
+            jobs = session.execute(stmt.limit(max(1, min(limit, 100)))).scalars().all()
+            normalized = [
+                NormalizedJob(
+                    job_id=f"db:{j.id}",
+                    company=j.company,
+                    title=j.title,
+                    description=j.description or None,
+                    requirements=j.education_requirement or None,
+                    employment_type=j.employment_type,
+                    location=j.location,
+                    remote_policy=j.remote_policy,
+                    published_at=j.published_at,
+                    source=j.source_platform,
+                    source_url=j.official_url,
+                    official_apply_url=j.apply_url,
+                    recruitment_email=j.recruitment_email,
+                    apply_method="EMAIL" if j.recruitment_email else (
+                        "OFFICIAL_FORM" if j.apply_url else "UNKNOWN"
+                    ),
+                    verification_status="LIKELY",
+                )
+                for j in jobs
+            ]
+        matcher = JobMatcher()
+        results = []
+        for j, norm in zip(jobs, normalized):
+            out = matcher.match(norm, profile, facts)
+            results.append({
+                "job_id": j.id, "title": j.title, "company": j.company,
+                "match_score": out.match_score, "eligibility": out.eligibility,
+                "recommendation": out.application_recommendation,
+                "relevant_fact_ids": out.relevant_fact_ids,
+                "explanation": out.explanation,
+            })
+        results.sort(key=lambda r: r["match_score"], reverse=True)
+        return _ok({"matches": results, "count": len(results)})
+
+    # ---------- applications (L0 read / L1 prepare / L2 submit) ----------
+
+    def _pipeline(self):
+        from ...applications.pipeline import ApplicationPipeline
+
+        return ApplicationPipeline(self.ctx.sessions, self._confirmations, user_id=self.user_id)
+
+    def list_application_candidates(self, limit: int = 20) -> dict[str, Any]:
+        """[L0 只读] 列出可申请的岗位候选(已匹配、未被排除、未重复投递)。"""
+        with self.ctx.session() as session:
+            from ...storage.models import Application, Job
+
+            rows = session.execute(select(Job).limit(max(1, min(limit, 100)))).scalars().all()
+            candidates = []
+            for j in rows:
+                app = session.execute(
+                    select(Application).where(Application.job_id == j.id)
+                ).scalar_one_or_none()
+                candidates.append({
+                    "job_id": j.id, "title": j.title, "company": j.company,
+                    "recruitment_email": j.recruitment_email,
+                    "application_status": app.status if app else None,
+                    "eligible": j.recruitment_email is not None or bool(j.apply_url),
+                })
+            return _ok({"candidates": candidates})
+
+    def prepare_application(
+        self,
+        job_id: int,
+        channel: str = "EMAIL",
+        recipient: str = "",
+        subject: str = "",
+        body: str = "",
+        resume_version_id: int | None = None,
+    ) -> dict[str, Any]:
+        """[L2 准备,无外部写入] 准备申请草稿+审批令牌。仅用岗位证据中的招聘邮箱;host 不能自批。"""
+        pipeline = self._pipeline()
+        app_id, _ = pipeline.ensure_application(job_id, channel=channel)
+        # Recipient MUST come from job evidence. Host-supplied recipient is
+        # ignored for EMAIL channel so the model cannot invent an address.
+        if channel == "EMAIL":
+            with self.ctx.session() as session:
+                job = session.get(Job, job_id)
+                recipient = (job.recruitment_email or "") if job else ""
+        return pipeline.prepare(
+            app_id, channel=channel, recipient=recipient, subject=subject, body=body,
+            resume_version_id=resume_version_id,
+        )
+
+    def preview_application(self, confirmation_token: str) -> dict[str, Any]:
+        """[L0 只读] 展示待批准申请草稿的完整内容(人类据此决定)。"""
+        record = self._confirmations.get_record(confirmation_token, user_id=self.user_id)
+        if record is None:
+            return _fail("confirmation_not_found", "token not found")
+        snapshot = record.get("plan_snapshot")
+        payload = json.loads(snapshot) if isinstance(snapshot, str) else (snapshot or {})
+        return _ok({
+            "status": record.get("status"),
+            "preview": payload.get("preview", payload),
+            "plan_sha256": record.get("plan_sha256"),
+        })
+
+    def approve_application(self, confirmation_token: str, allow_write: bool = False) -> dict[str, Any]:
+        """[L2 写入] 消费已由人类 CLI 批准的令牌,提交申请。模型调用本身不构成批准。"""
+        return self._pipeline().submit(confirmation_token, allow_write=allow_write)
+
+    def application_status(self, application_id: int | None = None) -> dict[str, Any]:
+        """[L0 只读] 查询申请状态与自动化开关。"""
+        return self._pipeline().status(application_id)
+
+    # ---------- email / inbox (L0 read / L1 sync) ----------
+
+    def email_connect_status(self) -> dict[str, Any]:
+        """[L0 只读] 查询邮箱连接状态。不返回任何凭证。"""
+        with self.ctx.session() as session:
+            rows = session.execute(
+                select(EmailAccount).where(EmailAccount.user_id == self.user_id)
+            ).scalars().all()
+            return _ok({
+                "accounts": [
+                    {"provider": a.provider, "email": a.email, "status": a.status}
+                    for a in rows
+                ],
+                "note": "Credentials are never stored in the database.",
+            })
+
+    def inbox_sync(self, since_iso: str = "", limit: int = 50) -> dict[str, Any]:
+        """[L1 受控外部操作] 增量同步招聘邮件,分类+关联;无法关联进人工队列,不擅自改状态。"""
+        from ...applications.email_provider import GmailOAuthProvider, ProviderUnavailable
+        from ...feedback.sync import InboxSyncService
+
+        provider = GmailOAuthProvider()
+        try:
+            authorized = provider.is_authorized()
+        except Exception:
+            authorized = False
+        if not authorized:
+            return _fail("mail_not_authorized", "configure OFFERBOMBER_GMAIL_CREDENTIALS first")
+        service = InboxSyncService(self.ctx.sessions, user_id=self.user_id)
+        return service.sync(provider, since_iso=since_iso or None, limit=limit)
+
+    def classify_recruitment_email(self, subject: str, body: str) -> dict[str, Any]:
+        """[L0 只读] 对招聘邮件做确定性分类(中英文),仅供人类/宿主参考,不单独改状态。"""
+        from ...feedback.classifier import EmailClassifier
+
+        return _ok(EmailClassifier().classify(subject, body).as_dict())
+
+    def interviews_list(self) -> dict[str, Any]:
+        """[L0 只读] 列出面试/笔试事件(含时区与是否已确认)。"""
+        from ...storage.models import RecruitmentEvent
+
+        with self.ctx.session() as session:
+            events = session.execute(
+                select(RecruitmentEvent).order_by(RecruitmentEvent.id)
+            ).scalars().all()
+            return _ok({
+                "events": [
+                    {
+                        "id": e.id, "type": e.event_type, "company": e.company,
+                        "title": e.title,
+                        "starts_at": e.starts_at.isoformat() if e.starts_at else None,
+                        "timezone": e.timezone, "confirmed": bool(e.confirmed),
+                    }
+                    for e in events
+                ]
+            })
+
+    # ---------- scheduler / report / system (L0 / L1) ----------
+
+    def tasks_list(self, limit: int = 50) -> dict[str, Any]:
+        """[L0 只读] 列出持久化任务及状态。"""
+        from ...scheduling.task_queue import TaskQueue
+
+        return TaskQueue(self.ctx.sessions, user_id=self.user_id).list_tasks(limit=limit)
+
+    def run_tasks(self, max_tasks: int = 5) -> dict[str, Any]:
+        """[L1 受控] 执行到期的持久化任务(受全局暂停开关约束,次数有上限)。"""
+        from ...scheduling.task_queue import TaskQueue
+
+        return TaskQueue(self.ctx.sessions, user_id=self.user_id).run_due({}, max_tasks=max_tasks)
+
+    def report_daily(self, days: int = 1) -> dict[str, Any]:
+        """[L0 只读] 生成日报(Markdown+JSON),写入本地输出目录。"""
+        from ...reporting.daily import DailyReport
+
+        out = Path(self.ctx.settings.storage.db_path).parent.parent / "output" / "reports"
+        return DailyReport(self.ctx.sessions, user_id=self.user_id).save(out, days=days)
+
+    def statistics(self) -> dict[str, Any]:
+        """[L0 只读] 汇总统计(岗位/申请/回复/事件),数字全部来自本地库。"""
+        return _ok(DailyReport(self.ctx.sessions, user_id=self.user_id).build(days=30))
+
+    def pause_automation(self, paused: bool = True) -> dict[str, Any]:
+        """[L1 本地控制] 一键暂停/恢复自动执行(默认暂停)。"""
+        return self._pipeline().pause(paused=paused)
+
+    def set_automation_mode(self, mode: str, max_per_day: int = 0) -> dict[str, Any]:
+        """[L1 本地控制] 设置 MANUAL/ASSISTED/AUTO 模式;AUTO 必须设每日上限。"""
+        return self._pipeline().set_mode(mode, max_per_day=max_per_day)
+
+    def system_health(self) -> dict[str, Any]:
+        """[L0 只读] 系统健康状态:数据库、各能力实现状态、邮箱授权、自动化开关。"""
+        from ...config import CAPABILITY_STATUS
+
+        with self.ctx.session() as session:
+            job_count = int(session.execute(select(func.count(Job.id))).scalar_one())
+        state = self.application_status().get("automation", {})
+        return _ok({
+            "database": "ok",
+            "fts5": self.ctx.fts_available,
+            "jobs_in_db": job_count,
+            "automation": state,
+            "capabilities": CAPABILITY_STATUS,
+        })

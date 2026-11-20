@@ -10,36 +10,32 @@ app:
 
 discovery:
   enabled: true
-  auto_expand_companies: true  # [NOT IMPLEMENTED] placeholder only
+  auto_expand_companies: true
   interval_hours: 4
   sources:
     - greenhouse
     - lever
     - ashby
-    - official_careers       # [NOT IMPLEMENTED] placeholder only
-    - search_engine          # [NOT IMPLEMENTED] placeholder only
-    - xiaohongshu_public     # [NOT IMPLEMENTED] placeholder only
-  companies:
-    - platform: greenhouse
-      token: stripe
-      name: Stripe
-    - platform: lever
-      token: leverdemo
-      name: Lever Demo
-    - platform: ashby
-      token: ashby
-      name: Ashby
+    - official_careers       # public careers pages / embedded JSON-LD
+    - search_engine          # requires discovery.search_provider below
+    - community_public       # requires user-configured public URLs
+  # Optional public careers URLs the user explicitly configured. Empty means
+  # no official-candidates pages are scanned. No URL is invented by the system.
+  careers_urls: []
+  # Optional official search API. base_url is FIXED here; never supplied by the
+  # model. Set api_key_env to the NAME of an env var holding the key (not the key).
+  # search_provider:
+  #   base_url: "https://api.example.com/search"
+  #   api_key_env: OFFERBOMBER_SEARCH_API_KEY
+  #   result_limit: 20
+  companies: []              # user/industry specific; no defaults hardcoded
 
 matching:
   broad_search: true
   exclude_hard_mismatches: true
-  target_fields:
-    - pretraining
-    - posttraining
-    - ai_infra
-    - machine_learning
-    - quantitative_research
-    - quantitative_engineering
+  # Preferences live in per-user JobSearchProfile campaigns, not here.
+  # Leaving target_fields empty imposes NO occupational constraint.
+  target_fields: []
 
 profile:
   allow_pdf_import: true
@@ -59,15 +55,16 @@ resume:
   cache_base_versions: true
 
 applications:
-  # [NOT IMPLEMENTED] no application preparation or sending in this release.
+  # Preparation is implemented. Sending requires human approval + credentials.
   auto_prepare: true
-  auto_send: false
+  auto_send: false           # Auto stays OFF; per-user opt-in in JobSearchProfile
   max_emails_per_day: 20
   require_verified_recipient: true
   prevent_duplicates: true
 
 email:
-  # [NOT IMPLEMENTED] no mail sync or reply in this release.
+  # Provider is selectable. Gmail OAuth reads OFFERBOMBER_GMAIL_CREDENTIALS
+  # (a path to a local credential file, never stored in the repo/DB).
   provider: gmail
   sync_minutes: 10
   auto_reply_low_risk: false
@@ -87,11 +84,11 @@ models:
   # [NOT LIVE-VERIFIED] adapters use documented interfaces but need real credentials
   # for live validation; mock results are never reported as real model calls.
 
-notifications:  # [NOT IMPLEMENTED] placeholder only
-  use_host_connectors: true
+notifications:
+  use_host_connectors: true  # optional; local file always records notifications
   urgent_enabled: true
 
-reports:  # [NOT IMPLEMENTED] placeholder only
+reports:
   daily_enabled: true
   daily_time: "21:00"
 

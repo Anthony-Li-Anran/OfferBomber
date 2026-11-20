@@ -166,6 +166,123 @@ def create_server() -> FastMCP:
         """[L0 只读] 查询当前用户已生成的简历版本及状态(按 user_id 隔离)。"""
         return toolkit().get_generation_status(job_id)
 
+    # ---------------- Phase 4-6: general-purpose job agent ----------------
+
+    @mcp.tool()
+    def search_profiles() -> dict[str, Any]:
+        """[L0 只读] 列出当前用户的所有求职配置(支持多个求职活动)。"""
+        return toolkit().search_profiles()
+
+    @mcp.tool()
+    def create_search_profile(criteria_json: str) -> dict[str, Any]:
+        """[L1 写入] 创建通用求职配置。JSON 字段全部可空;未设置=不限制,系统不自行推断或强加限制。"""
+        return toolkit().create_search_profile(criteria_json)
+
+    @mcp.tool()
+    def update_search_profile(profile_id: int, criteria_json: str) -> dict[str, Any]:
+        """[L1 写入] 更新本人求职配置;非本人的 profile_id 被拒绝。"""
+        return toolkit().update_search_profile(profile_id, criteria_json)
+
+    @mcp.tool()
+    def discover_companies(profile_id: int, max_companies: int = 20) -> dict[str, Any]:
+        """[L1 受控网络发现] 从配置生成查询、用已配置搜索源自动发现并验证企业招聘入口。不接受任意 URL,不绕过登录/验证码。"""
+        return toolkit().discover_companies(profile_id, max_companies)
+
+    @mcp.tool()
+    def import_jobs(file_path: str) -> dict[str, Any]:
+        """[L1 本地导入] 从用户提供的本地 CSV/JSON 导入岗位。不接受网络 URL。"""
+        return toolkit().import_jobs(file_path)
+
+    @mcp.tool()
+    def match_jobs(profile_id: int, job_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        """[L0 只读] 用当前用户已确认事实按配置对岗位通用匹配。硬性条件与一般偏好分开,语义不匹配不等于资格不符。"""
+        return toolkit().match_jobs(profile_id, job_id, limit)
+
+    @mcp.tool()
+    def list_application_candidates(limit: int = 20) -> dict[str, Any]:
+        """[L0 只读] 列出可申请的岗位候选(匹配状态/招聘渠道/是否已投递)。"""
+        return toolkit().list_application_candidates(limit)
+
+    @mcp.tool()
+    def prepare_application(
+        job_id: int, channel: str = "EMAIL", recipient: str = "", subject: str = "",
+        body: str = "", resume_version_id: int | None = None,
+    ) -> dict[str, Any]:
+        """[L2 准备,无外部发送] 准备申请草稿并返回审批令牌。收件地址取自岗位证据;模型不能自批。"""
+        return toolkit().prepare_application(
+            job_id, channel, recipient, subject, body, resume_version_id
+        )
+
+    @mcp.tool()
+    def preview_application(confirmation_token: str) -> dict[str, Any]:
+        """[L0 只读] 展示待批准申请草稿完整内容。人类据此决定,不单独产生发送。"""
+        return toolkit().preview_application(confirmation_token)
+
+    @mcp.tool()
+    def approve_application(confirmation_token: str, allow_write: bool = False) -> dict[str, Any]:
+        """[L2 写入] 提交已由人类 CLI 批准的申请;重复令牌/未批准/超限均拒绝。模型调用不构成批准。"""
+        return toolkit().approve_application(confirmation_token, allow_write)
+
+    @mcp.tool()
+    def application_status(application_id: int | None = None) -> dict[str, Any]:
+        """[L0 只读] 查询申请状态轨迹与自动化开关。"""
+        return toolkit().application_status(application_id)
+
+    @mcp.tool()
+    def email_connect_status() -> dict[str, Any]:
+        """[L0 只读] 查询邮箱连接状态(不含任何凭证)。"""
+        return toolkit().email_connect_status()
+
+    @mcp.tool()
+    def inbox_sync(since_iso: str = "", limit: int = 50) -> dict[str, Any]:
+        """[L1 受控外部操作] 增量同步招聘邮件并分类关联;无法关联进人工队列,不擅自改状态。无授权则明确失败。"""
+        return toolkit().inbox_sync(since_iso, limit)
+
+    @mcp.tool()
+    def classify_recruitment_email(subject: str, body: str) -> dict[str, Any]:
+        """[L0 只读] 招聘邮件中英文确定性分类,仅供人类参考,不单独改申请状态。"""
+        return toolkit().classify_recruitment_email(subject, body)
+
+    @mcp.tool()
+    def interviews_list() -> dict[str, Any]:
+        """[L0 只读] 列出面试/笔试事件(含时区与确认状态)。"""
+        return toolkit().interviews_list()
+
+    @mcp.tool()
+    def tasks_list(limit: int = 50) -> dict[str, Any]:
+        """[L0 只读] 列出持久化任务及状态。"""
+        return toolkit().tasks_list(limit)
+
+    @mcp.tool()
+    def run_tasks(max_tasks: int = 5) -> dict[str, Any]:
+        """[L1 受控] 执行到期任务(受全局暂停约束,次数上限 50)。"""
+        return toolkit().run_tasks(max_tasks)
+
+    @mcp.tool()
+    def report_daily(days: int = 1) -> dict[str, Any]:
+        """[L0 只读] 生成日报(Markdown+JSON)到本地输出目录。"""
+        return toolkit().report_daily(days)
+
+    @mcp.tool()
+    def statistics() -> dict[str, Any]:
+        """[L0 只读] 汇总统计(岗位/申请/回复/事件),数字全部来自本地库。"""
+        return toolkit().statistics()
+
+    @mcp.tool()
+    def pause_automation(paused: bool = True) -> dict[str, Any]:
+        """[L1 本地控制] 一键暂停/恢复自动执行(默认暂停)。"""
+        return toolkit().pause_automation(paused)
+
+    @mcp.tool()
+    def set_automation_mode(mode: str, max_per_day: int = 0) -> dict[str, Any]:
+        """[L1 本地控制] 设置 MANUAL/ASSISTED/AUTO;AUTO 必须给每日上限,默认仍暂停。"""
+        return toolkit().set_automation_mode(mode, max_per_day)
+
+    @mcp.tool()
+    def system_health() -> dict[str, Any]:
+        """[L0 只读] 系统健康:数据库/FTS/岗位数/自动化开关/各能力实现状态。"""
+        return toolkit().system_health()
+
     return mcp
 
 

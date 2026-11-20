@@ -484,3 +484,103 @@ class McpConfirmation(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTimeUTC, nullable=False)
     approved_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
+
+
+# --------------------------------------------------------------------------
+# Phase 4-6: general-purpose job-search agent
+# --------------------------------------------------------------------------
+
+
+class SearchProfile(Base, TimestampMixin):
+    """A reusable, user-scoped job-search campaign. All preference fields live
+    in a JSON blob so any industry/role/language is representable without code
+    changes. No field is required; unset preferences impose no constraint.
+    """
+
+    __tablename__ = "search_profiles"
+    __table_args__ = (Index("ix_search_profiles_user", "user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), default="default", nullable=False)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    criteria: Mapped[str] = mapped_column(Text, nullable=False)  # canonical JSON
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class EmailAccount(Base, TimestampMixin):
+    """Connected mailbox metadata. Credentials are NEVER stored here: only an
+    opaque reference to an OS keyring / env var / host connector is kept.
+    """
+
+    __tablename__ = "email_accounts"
+    __table_args__ = (UniqueConstraint("user_id", "email", name="uq_email_account_user_email"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), default="default", nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)  # gmail | imap_smtp | host
+    email: Mapped[str] = mapped_column(String(300), nullable=False)
+    credential_ref: Mapped[str | None] = mapped_column(String(300))  # keyring key / env name
+    status: Mapped[str] = mapped_column(String(30), default="DISCONNECTED", nullable=False)
+    scopes: Mapped[str | None] = mapped_column(Text)  # JSON list
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
+
+
+class EmailTemplate(Base, TimestampMixin):
+    """Approved reusable reply template. Low-risk auto-reply only."""
+
+    __tablename__ = "email_templates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), default="default", nullable=False)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    category: Mapped[str] = mapped_column(String(60), nullable=False)
+    subject: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str] = mapped_column(String(20), default="", nullable=False)
+
+
+class ApplicationDraft(Base, TimestampMixin):
+    """Prepared-but-not-submitted application. Bound to an approval token."""
+
+    __tablename__ = "application_drafts"
+    __table_args__ = (Index("ix_app_drafts_user", "user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), default="default", nullable=False)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(40), nullable=False)
+    recipient: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    subject: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    resume_version_id: Mapped[int | None] = mapped_column(ForeignKey("resume_versions.id"))
+    attachment_path: Mapped[str | None] = mapped_column(Text)
+    confirmation_token: Mapped[str | None] = mapped_column(String(200), index=True)
+    payload_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="READY", nullable=False)
+
+
+class AutomationState(Base, TimestampMixin):
+    """Single per-user automation control row: pause flag, daily caps."""
+
+    __tablename__ = "automation_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    paused: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)  # Auto OFF by default
+    mode: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)  # MANUAL|ASSISTED|AUTO
+    max_per_day: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sent_today: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    counter_date: Mapped[str | None] = mapped_column(String(10))  # YYYY-MM-DD local date
+
+
+class DiscoveryRun(Base, TimestampMixin):
+    """Quality/coverage statistics for one discovery run."""
+
+    __tablename__ = "discovery_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(100), default="default", nullable=False)
+    profile_id: Mapped[int | None] = mapped_column(ForeignKey("search_profiles.id", ondelete="SET NULL"))
+    stats: Mapped[str] = mapped_column(Text, nullable=False)  # JSON

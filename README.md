@@ -1,6 +1,6 @@
 # OfferBomber
 
-Local-first personal job-hunting automation system. Phase 1 (discovery), Phase 2 (experience knowledge base) and Phase 3 (model-driven JD → resume → PDF closed loop) are implemented, tested and operable from the CLI.
+Local-first, general-purpose AI job-hunting agent. Any user can install it, define their own JobSearchProfile (any industry/role/region/language), discover and match real jobs, generate tailored resumes, prepare and (after human approval) submit applications, track recruitment replies, and get daily reports. Version 0.4.0 — Phases 1–6 implemented. No occupational, school, city or employer assumptions are hardcoded; all preferences live in user-owned configuration.
 
 ## Status
 
@@ -14,7 +14,12 @@ Local-first personal job-hunting automation system. Phase 1 (discovery), Phase 2
 | DeepSeek Harness model adapter | Adapter implemented; **not live-verified** (needs `dsh` runtime) |
 | Automatic job application sending | Not implemented |
 | Email management / sync | Not implemented |
-| MCP Server (14 tools, stdio) | **Implemented & verified** at MCP protocol level; Phase 3.3 security hardened |
+| MCP Server (36 tools, stdio) | **Implemented & verified** at MCP protocol level; Phase 3.3 security hardened |
+| JobSearchProfile campaigns | **Implemented** — multiple per user, all fields optional, no hardcoded preferences |
+| Multi-source discovery | **Implemented** — ATS + official JSON-LD careers + user-configured search/community + CSV/JSON import |
+| Universal matching | **Implemented** — profile dimensions + confirmed facts, hard/soft constraints separated |
+| Applications & email | **Implemented** — drafts, human approval, idempotent submit; real send needs credentials |
+| Feedback / scheduler / reports | **Implemented** — inbox sync, classification, SQLite task queue, Markdown+JSON daily report |
 | MCP human approval (local CLI) | **Implemented** (`offerbomber mcp pending/preview/approve/reject`) |
 | Scheduler | Not implemented |
 
@@ -168,7 +173,9 @@ The full 25-table task-book schema plus `resume_imports` and the FTS5 virtual ta
 ## Tests
 
 ```bash
-PYTHONPATH=src pytest tests/ -q        # 139 passed (verified 2026-11-20, Phase 3.3)
+PYTHONPATH=src pytest tests/ -q        # 171 passed, 1 skipped (verified 2026-11-20, Phase 4-6)
+# The single skip is the real-Gmail integration test, enabled only with explicit
+# user authorization (OFFERBOMBER_LIVE_GMAIL_TEST=1). No mock is counted as real.
 ```
 
 The authoritative test count is the number reported by an actual `pytest -q` run, never a count of test functions. See `.github/workflows/ci.yml` — CI runs the same suite on Python 3.12 with no real credentials.
@@ -181,7 +188,7 @@ Coverage includes Chinese dedup, malformed source isolation, single-record isola
 - `official_careers`, `search_engine`, `xiaohongshu_public` and `auto_expand_companies` are configuration placeholders only.
 - WorkBuddy and DeepSeek Harness adapters are implemented against documented interfaces but **not live-verified** (no credentials/runtime here). The optional `openai_compatible` adapter was live-verified with a real DeepSeek key (2026-11-20) for structured JD analysis; it is off by default. Without any configured real provider, `auto` uses Mock and says so.
 - Reactive Resume generation requires a real API key and a source resume id; automated PDF checks cannot certify visual layout — human preview is required.
-- Email, applications, reports and scheduling are not implemented in this release. The MCP server **is** implemented (14 tools, stdio transport).
+- Email sending, applications, reports and scheduling ARE implemented locally. Real email send and inbox sync require the user to configure Gmail OAuth credentials (`OFFERBOMBER_GMAIL_CREDENTIALS`) and explicitly approve each application; without them the tools fail closed and no fake success is reported. The MCP server is implemented (36 tools, stdio transport).
 - Recruitment email extraction is not implemented; `apply_method` stays `official_form`/`unknown`.
 
 ## License

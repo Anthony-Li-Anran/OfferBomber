@@ -33,7 +33,7 @@ jobs:
           OFFERBOMBER_DB_URL: sqlite:///${{ github.workspace }}/.ci-migrations.db
         run: |
           python -m alembic upgrade head
-          python -c "import sqlite3; c=sqlite3.connect('.ci-migrations.db'); t={r[0] for r in c.execute(\"select name from sqlite_master where type='table'\")}; assert 'mcp_confirmations' in t and 'resume_versions' in t, t; print('migration schema OK')"
+          python -c "import sqlite3; c=sqlite3.connect('.ci-migrations.db'); t={r[0] for r in c.execute(\"select name from sqlite_master where type='table'\")}; required={'mcp_confirmations','resume_versions','search_profiles','email_accounts','application_drafts','automation_states','discovery_runs'}; assert required <= t, required - t; print('migration schema OK')"
           python -m alembic downgrade base
 
       - name: Run test suite

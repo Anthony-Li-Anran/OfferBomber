@@ -21,10 +21,11 @@ CAPABILITY_STATUS: dict[str, str] = {
     "discovery.greenhouse": "implemented",
     "discovery.lever": "implemented",
     "discovery.ashby": "implemented",
-    "discovery.official_careers": "not_implemented",
-    "discovery.search_engine": "not_implemented",
-    "discovery.xiaohongshu_public": "not_implemented",
-    "discovery.auto_expand_companies": "not_implemented",
+    "discovery.official_careers": "implemented",
+    "discovery.search_engine": "implemented_config_required",
+    "discovery.community_public": "implemented_config_required",
+    "discovery.custom_import": "implemented",
+    "discovery.auto_expand_companies": "implemented_config_required",
     "profile.pdf_import": "implemented",
     "profile.manual_updates": "implemented",
     "profile.fact_provenance": "implemented",
@@ -35,18 +36,21 @@ CAPABILITY_STATUS: dict[str, str] = {
     "resume.model_planning": "implemented",
     "jobs.model_analysis": "implemented",
     "search.model_reranking": "implemented",
-    "applications.auto_prepare": "not_implemented",
-    "applications.auto_send": "not_implemented",
-    "email.sync": "not_implemented",
+    "applications.auto_prepare": "implemented",
+    "applications.auto_send": "implemented_requires_human_approval_and_credentials",
+    "email.sync": "implemented_requires_credentials",
     "email.auto_reply": "not_implemented",
+    "search_profiles": "implemented",
+    "matching.general_purpose": "implemented",
+    "scheduling": "implemented_local_sqlite",
+    "notifications": "implemented_local_file_host_connector_optional",
+    "reports.daily": "implemented",
     "models.provider_abstraction": "implemented",
     "models.mock_provider": "implemented",
     "models.workbuddy_provider": "adapter_implemented_not_live_verified",
     "models.deepseek_harness_provider": "adapter_implemented_not_live_verified",
     "models.openai_compatible_provider": "adapter_implemented_not_live_verified",
     "models.host_or_standalone_calls": "not_implemented",
-    "notifications": "not_implemented",
-    "reports": "not_implemented",
 }
 
 
@@ -67,12 +71,25 @@ class CompanySource(BaseModel):
     name: str | None = None
 
 
+class SearchProviderConfigModel(BaseModel):
+    """A user-configured official search API. base_url is fixed here (never from
+    model input); the API key is named by api_key_env, never stored in config."""
+
+    base_url: str = ""
+    api_key_env: str = ""
+    result_limit: int = Field(default=20, ge=1, le=50)
+
+
 class DiscoveryConfig(BaseModel):
     enabled: bool = True
     auto_expand_companies: bool = True
     interval_hours: int = Field(default=4, ge=1)
     sources: list[str] = Field(default_factory=list)
     companies: list[CompanySource] = Field(default_factory=list)
+    # Optional public careers URLs the user explicitly configured; no arbitrary
+    # model-supplied URL is ever fetched.
+    careers_urls: list[str] = Field(default_factory=list)
+    search_provider: SearchProviderConfigModel | None = None
 
 
 class MatchingConfig(BaseModel):
