@@ -195,12 +195,17 @@ class ResumePlan(Base, TimestampMixin):
 class ResumeVersion(Base, TimestampMixin):
     __tablename__ = "resume_versions"
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(100), default="default", server_default="default", index=True,
+        nullable=False,
+    )
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
     plan_id: Mapped[int | None] = mapped_column(ForeignKey("resume_plans.id"))
     file_path: Mapped[str] = mapped_column(Text)
     file_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     immutable: Mapped[bool] = mapped_column(Boolean, default=True)
     fact_snapshot: Mapped[str | None] = mapped_column(Text)  # JSON
+    plan_sha256: Mapped[str | None] = mapped_column(String(64), index=True)  # Phase 3.3
 
 
 # --------------------------------------------------------------------------
@@ -446,3 +451,36 @@ class Setting(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     key: Mapped[str] = mapped_column(String(150), unique=True)
     value: Mapped[str] = mapped_column(Text)
+
+
+# --------------------------------------------------------------------------
+# MCP confirmation ledger (Phase 3.3)
+# --------------------------------------------------------------------------
+
+
+class McpConfirmation(Base):
+    """Durable, atomically-consumed human-approval record for MCP write tools.
+
+    Only a hash of the high-entropy token is stored. State transitions:
+    PENDING -> APPROVED -> CONSUMED, or PENDING -> REJECTED / EXPIRED.
+    """
+
+    __tablename__ = "mcp_confirmations"
+    __table_args__ = (Index("ix_mcp_confirmations_status", "status"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(60), nullable=False)
+    job_id: Mapped[int | None] = mapped_column(Integer)
+    source_resume_id: Mapped[str | None] = mapped_column(String(200))
+    plan_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    plan_snapshot: Mapped[str | None] = mapped_column(Text)  # canonical JSON
+    fact_versions: Mapped[str | None] = mapped_column(Text)  # JSON
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTimeUTC, server_default=func.current_timestamp(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTimeUTC, nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTimeUTC)

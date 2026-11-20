@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio respx httpx
+
+      - name: Check imports (compileall)
+        run: python -m compileall -q src
+
+      - name: Validate database migrations from scratch
+        env:
+          OFFERBOMBER_DB_URL: sqlite:///${{ github.workspace }}/.ci-migrations.db
+        run: |
+          python -m alembic upgrade head
+          python -c "import sqlite3; c=sqlite3.connect('.ci-migrations.db'); t={r[0] for r in c.execute(\"select name from sqlite_master where type='table'\")}; assert 'mcp_confirmations' in t and 'resume_versions' in t, t; print('migration schema OK')"
+          python -m alembic downgrade base
+
+      - name: Run test suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+          # No real credentials. Tests that need a live API key must skip/mock.
+          OFFERBOMBER_RXRESUME_API_KEY: ""
+        run: python -m pytest -q

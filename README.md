@@ -14,7 +14,8 @@ Local-first personal job-hunting automation system. Phase 1 (discovery), Phase 2
 | DeepSeek Harness model adapter | Adapter implemented; **not live-verified** (needs `dsh` runtime) |
 | Automatic job application sending | Not implemented |
 | Email management / sync | Not implemented |
-| MCP Server (12 tools, stdio) | **Implemented & verified** at MCP protocol level; host integration pending |
+| MCP Server (14 tools, stdio) | **Implemented & verified** at MCP protocol level; Phase 3.3 security hardened |
+| MCP human approval (local CLI) | **Implemented** (`offerbomber mcp pending/preview/approve/reject`) |
 | Scheduler | Not implemented |
 
 See `CAPABILITY_STATUS` for the authoritative, machine-readable status list.
@@ -24,6 +25,14 @@ OfferBomber over MCP — no model API key needed. See `docs/MCP_INTEGRATION.md` 
 `src/offerbomber/integrations/mcp/server.py`. The server is verified at the real MCP
 protocol level (stdio handshake + tools/list + tools/call); WorkBuddy/dsh host-side
 integration still needs to be performed in the user's environment.
+
+### MCP security model (Phase 3.3)
+
+- **L0** read-only tools; **L1** controlled job discovery (configured sources only, no arbitrary URL); **L2** file writes / external service operations.
+- Fact access is user-scoped: a fact must exist, belong to the current user, be `CONFIRMED` and not deleted — one bad ID fails the whole request.
+- **Human approval is out-of-band.** A host model can never approve its own write. `prepare_*` returns a preview plus a token; a human reviews it and runs `offerbomber mcp approve <token>` in a local terminal. Only then can `generate_resume`/`export_pdf` proceed. `allow_write` is a secondary gate, not the human signal. MCP Elicitation is intentionally not used: the MCP spec forbids using it to request credentials and it is not a reliable authorization signal.
+- The approved plan is an immutable, SHA-256-bound snapshot. There is no `final_facts` override after approval; a changed fact version invalidates the approval.
+- Confirmations live in SQLite (token hash only, atomic single consumption, TTL, cross-process). Resume versions are user-scoped.
 
 `offerbomber model doctor` and `offerbomber resume generate` report the exact live status. Mock results are never presented as real model calls or real PDF generation.
 
@@ -159,8 +168,10 @@ The full 25-table task-book schema plus `resume_imports` and the FTS5 virtual ta
 ## Tests
 
 ```bash
-PYTHONPATH=src pytest tests/ -q        # 93 passed
+PYTHONPATH=src pytest tests/ -q        # 139 passed (verified 2026-11-20, Phase 3.3)
 ```
+
+The authoritative test count is the number reported by an actual `pytest -q` run, never a count of test functions. See `.github/workflows/ci.yml` — CI runs the same suite on Python 3.12 with no real credentials.
 
 Coverage includes Chinese dedup, malformed source isolation, single-record isolation, PDF extraction, duplicate PDF import, full experience creation, fact addition, version history, archive/restore, Chinese and English retrieval, requirement ranking, unconfirmed-fact exclusion, snapshot immutability, restart persistence, a fresh Alembic upgrade, FTS/revision consistency and atomic rollback on index failure (Phase 3 Part A), all model failure classes and safety guards, model parsing truthfulness, JD evidence separation, reranking ID validation, smart-planning budget/provenance, Reactive Resume mapping/validation/mock-HTTP flow, four end-to-end scenarios (ML job, quant job, submission-not-accepted, service failure), and the Phase 3.2 hardening suite (`test_phase32_hardening.py`): FactAudit/body/snapshot text identity on rejected rewrites, untrusted-skill rejection, research-vs-publication classification, publication-status preservation, target-position resolution, and authenticated health-check codes (ok/401/429/503/timeout/no-key).
 
@@ -170,7 +181,7 @@ Coverage includes Chinese dedup, malformed source isolation, single-record isola
 - `official_careers`, `search_engine`, `xiaohongshu_public` and `auto_expand_companies` are configuration placeholders only.
 - WorkBuddy and DeepSeek Harness adapters are implemented against documented interfaces but **not live-verified** (no credentials/runtime here). The optional `openai_compatible` adapter was live-verified with a real DeepSeek key (2026-11-20) for structured JD analysis; it is off by default. Without any configured real provider, `auto` uses Mock and says so.
 - Reactive Resume generation requires a real API key and a source resume id; automated PDF checks cannot certify visual layout — human preview is required.
-- Email, applications, reports, MCP server and scheduling are not implemented in this release.
+- Email, applications, reports and scheduling are not implemented in this release. The MCP server **is** implemented (14 tools, stdio transport).
 - Recruitment email extraction is not implemented; `apply_method` stays `official_form`/`unknown`.
 
 ## License

@@ -90,8 +90,33 @@ def toolkit(tmp_path: Path) -> McpToolkit:
 # ---------------------------------------------------------------- protocol level
 
 
+@pytest.fixture()
+def stdio_config(tmp_path: Path) -> Path:
+    """Isolated config + fresh DB for real stdio subprocess tests.
+
+    Never bind protocol tests to the developer's real database: the schema may
+    predate a migration. Build a current-schema DB in a temp dir instead.
+    """
+    import yaml
+
+    raw = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    db = tmp_path / "protocol.db"
+    raw["storage"]["db_path"] = str(db)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+
+    from offerbomber.storage.base import Base, make_engine
+    from offerbomber.storage.fts import ensure_fts5
+
+    engine = make_engine(db)
+    Base.metadata.create_all(engine)  # current schema, incl. Phase 3.3 columns
+    ensure_fts5(engine)
+    engine.dispose()
+    return cfg
+
+
 @pytest.mark.asyncio
-async def test_real_stdio_protocol_handshake_and_tools():
+async def test_real_stdio_protocol_handshake_and_tools(stdio_config: Path):
     """真实 MCP stdio 子进程:握手 + 列工具 + 实际 tool call。非 mock。"""
     params = StdioServerParameters(
         command=sys.executable,
@@ -99,7 +124,7 @@ async def test_real_stdio_protocol_handshake_and_tools():
         env={
             **os.environ,
             "PYTHONPATH": str(ROOT / "src"),
-            "OFFERBOMBER_MCP_CONFIG": str(ROOT / "config.example.yaml"),
+            "OFFERBOMBER_MCP_CONFIG": str(stdio_config),
         },
         cwd=str(ROOT),
     )
@@ -126,13 +151,13 @@ async def test_real_stdio_protocol_handshake_and_tools():
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_has_input_schema():
+async def test_mcp_tool_has_input_schema(stdio_config: Path):
     """每个工具必须带 JSON Schema 输入契约,宿主才能正确调用。"""
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "offerbomber.integrations.mcp.server"],
         env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
-             "OFFERBOMBER_MCP_CONFIG": str(ROOT / "config.example.yaml")},
+             "OFFERBOMBER_MCP_CONFIG": str(stdio_config)},
         cwd=str(ROOT),
     )
     async with stdio_client(params) as (read, write):
@@ -241,11 +266,13 @@ def test_prepare_generation_is_readonly_and_validates(toolkit):
     assert r["preview"]["action"] == "generate_resume"
 
 
-def test_generate_blocked_without_allow_write(toolkit, monkeypatch):
+def test_generate_blocked_without_human_approval(toolkit, monkeypatch):
+    """Phase 3.3: a PENDING token is refused even when allow_write=True —
+    the model is never the approver; a human must approve out-of-band."""
     monkeypatch.delenv("OFFERBOMBER_MCP_ALLOW_WRITE", raising=False)
     prep = toolkit.prepare_generation(1, "source-1", [100])
-    r = toolkit.generate_resume(prep["confirmation_token"], allow_write=False)
-    assert r["ok"] is False and r["error"] == "write_not_allowed"
+    r = toolkit.generate_resume(prep["confirmation_token"], allow_write=True)
+    assert r["ok"] is False and r["error"] == "not_approved"
 
 
 def test_export_requires_confirmation(toolkit):
@@ -254,13 +281,16 @@ def test_export_requires_confirmation(toolkit):
 
 
 def test_confirmation_token_single_use(toolkit, monkeypatch):
-    """令牌用后即焚,防止重复提交。"""
+    """令牌用后即焚,防止重复提交。经人类批准后消费一次即失效。"""
     monkeypatch.delenv("OFFERBOMBER_MCP_ALLOW_WRITE", raising=False)
     prep = toolkit.prepare_generation(1, "source-1", [100])
     token = prep["confirmation_token"]
-    first = toolkit.generate_resume(token, allow_write=False)  # blocked, token still pending
-    assert first["error"] == "write_not_allowed"
-    # allow_write 但没真实 RR key 会在生成阶段失败,不应留下"成功"假象
+    # 未批准时即使 allow_write=True 也被拒绝,令牌保持 PENDING
+    first = toolkit.generate_resume(token, allow_write=True)
+    assert first["error"] == "not_approved"
+    # 人类批准(模拟本地 CLI)
+    assert toolkit._confirmations.approve(token, user_id=toolkit.user_id)
+    # 批准后消费;无真实 RR key 会在生成阶段失败,不应留下"成功"假象
     second = toolkit.generate_resume(token, allow_write=True)
     assert second["ok"] is False or second["ok"] is True  # either way, token consumed
     third = toolkit.generate_resume(token, allow_write=True)
@@ -283,9 +313,12 @@ def test_confirmation_survives_new_toolkit_instance(toolkit: McpToolkit):
         # Independent toolkit/AppContext, but same on-disk confirmation store.
         return McpToolkit(toolkit.ctx, user_id=toolkit.user_id)
 
-    # Process B: fresh toolkit, token must still be pending on disk.
-    blocked = fresh().generate_resume(token, allow_write=False)
-    assert blocked["error"] == "write_not_allowed"  # token recognized, only write gate blocks
+    # Process B: fresh toolkit sees the token still pending (approval required).
+    blocked = fresh().generate_resume(token, allow_write=True)
+    assert blocked["error"] == "not_approved"
+
+    # Human approval persists across instances (simulates local CLI in another process).
+    assert fresh()._confirmations.approve(token, user_id=toolkit.user_id)
 
     # Process C: another fresh instance consumes it (single-use).
     third = fresh().generate_resume(token, allow_write=True)

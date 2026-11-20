@@ -109,3 +109,35 @@
 - 结果：HTTP 200；`required_skills` 正确区分 MUST（Python、Statistics）与 NICE_TO_HAVE（C++、论文），每条带原文 evidence；`job_title` 由权威 `Job.title` 注入、未被模型覆盖；`job_id` 注入；`resume_language=en`；`analysis_provider=openai_compatible`；未出现证据幻觉告警。
 - 结论：**`openai_compatible` 适配器为真实联调通过**（真实 key、真实模型输出）；`workbuddy` 与 `deepseek_harness` 本轮未涉及，仍为"适配器已实现、待真实联调"。Mock 与真实调用严格区分，未虚报。
 - 复测方式：设置三个环境变量后运行 `offerbomber model test` 或任意走 `JOB_ANALYSIS` 的命令。
+
+## 十、Phase 3.3 — MCP 安全加固与宿主集成（2026-11-20）
+
+本轮把 MCP 原型升级为可供宿主长期使用的安全工具系统。开发在独立分支 `phase3.3-mcp-security` 进行，未强制覆盖 main，未清理用户数据库，未生成/发送任何真实求职申请。
+
+### P0 A 数据权限与事实安全
+- **A1 用户隔离**：新增 `integrations/mcp/authorization.py`，`load_authorized_facts()` 统一校验「事实存在 + 所属 Experience 属当前用户 + CONFIRMED + 未删除」，任一失败整单拒绝。`build_resume_plan` / `validate_resume_facts` / `prepare_generation` / `_run_generation` 全部改用它；`get_generation_status`、`resume show` 按 `user_id` 隔离。`ResumeVersion` 增加 `user_id`、`plan_sha256` 列及 Alembic 迁移 `9f2a1c7d4e83`。
+- **A2 技能注入**：`prepare_generation` 从已确认事实构建可信技能集合，宿主 `final_plan_json` 的技能只能在此集合内选择，`QuantumTeleportation` / `ForgedSkill` 被剔除。
+- **A3 改写可追溯**：`FactAudit` 增加 `evidence`、`validation_status`（VERIFIED/REVERTED/REVIEW_REQUIRED）；无法证明的改写保留原文并标记 REVERTED。
+
+### P0 B 确认机制重建
+- **B1/B2 令牌绑定规划**：`prepare_generation` 接收宿主重排内容，规范化为确定性 JSON，计算 SHA-256，令牌绑定规划快照/哈希/用户/岗位/源简历/事实版本/到期时间。`generate_resume` 移除 `final_facts` 参数，只渲染已批准快照；事实版本变化则审批失效。
+- **B3 人类确认**：核查 MCP Elicitation 规范——明确禁止表单式 elicitation 索取凭证，且它不是服务器可验证的授权信号；WorkBuddy 宿主未提供可靠批准信号。故实现本地 CLI 带外审批：`offerbomber mcp pending/preview/approve/reject`。`allow_write` 降为二级闸门，不再是批准本身。
+- **B4 ConfirmationStore**：从 JSON 读改写改为 SQLite 账本（`mcp_confirmations`），仅存令牌哈希、TTL、状态机 PENDING→APPROVED→CONSUMED（或 REJECTED/EXPIRED），条件 UPDATE 原子消费——并发测试验证两线程同时消费最多一个成功。
+
+### Part C 工具体系
+- 新增 `discover_jobs`（L1）：仅用配置中已启用招聘源，不接受任意 URL（无 SSRF 向量），复用既有去重/隔离/限流，单源失败不影响其他源，不投递/不发邮件。
+- 工具分级 L0/L1/L2 写入 docstring；新增 `validate_generated_pdf`（L0 只读），`export_pdf` 标注为兼容别名并强制人类批准；文档如实说明仅 stdio，Streamable HTTP 未实现。工具总数 14。
+
+### Part D 宿主集成核查
+- WorkBuddy：stdio `mcpServers`（command/args/env）结构由本机配置确认，工具发现/调用走标准 `tools/list` / `tools/call`。当前 WorkBuddy 会话曾真实加载旧版 12 工具并调用；Phase 3.3 的 14 工具与 CLI 审批流程待重启后复验，**本轮不声称完成真实宿主端到端**。
+- DeepSeek Harness：当前环境未安装 dsh，提供文档核实过的配置样例，标记未真实验证。
+
+### Part E/G 工程与交付
+- 文档状态统一：README、CAPABILITY_STATUS、MCP_INTEGRATION.md 的工具数与状态一致，测试数改为真实 `pytest -q` 结果。
+- 新增 `.github/workflows/ci.yml`：Python 3.12，安装依赖、compileall、从零跑 Alembic 迁移、无真实凭证跑 pytest。
+- 隐私扫描：密钥仅在用户目录，仓库无 API key/token/简历/数据库/输出文件。
+
+### 测试结果
+- `pytest -q` → **139 passed**（110 原有 + 29 新增 `tests/test_phase33_security.py`，覆盖 Part F 全部 27 项要求 + 2 项加强）。
+- 无密钥干净环境（`HOME` 指向空目录、API key 置空）下同样 139 passed，CI 可无凭证运行。
+- Alembic 迁移链在隔离临时库从空库 `upgrade head` 成功，含 `user_id`、`plan_sha256`、`mcp_confirmations`。

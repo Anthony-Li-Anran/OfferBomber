@@ -15,7 +15,7 @@ import structlog
 import typer
 from sqlalchemy import select
 
-from .app import AppContext
+from .app import AppContext, resolve_db_path
 from .config import load_settings, unimplemented_capabilities, write_default_config
 from .core.discovery_service import DiscoveryService
 from .core.job_analysis import JobAnalyzer
@@ -43,10 +43,11 @@ fact_app = typer.Typer(help="Manage atomic facts")
 search_app = typer.Typer(help="Search the experience knowledge base")
 resume_app = typer.Typer(help="Resume planning, generation and versions")
 model_app = typer.Typer(help="Model provider diagnostics")
+mcp_app = typer.Typer(help="Human approval of pending MCP write operations")
 for sub_app, name in (
     (jobs_app, "jobs"), (profile_app, "profile"), (experience_app, "experience"),
     (fact_app, "fact"), (search_app, "search"), (resume_app, "resume"),
-    (model_app, "model"),
+    (model_app, "model"), (mcp_app, "mcp"),
 ):
     app.add_typer(sub_app, name=name)
 
@@ -848,18 +849,101 @@ def resume_versions(
 def resume_show(
     id: int = typer.Option(..., "--id"),
     config: Path = typer.Option(None, "--config"),
+    user_id: str = typer.Option("default", "--user"),
 ) -> None:
-    """Show one generated resume version with its fact snapshot."""
+    """Show one generated resume version with its fact snapshot (user-scoped)."""
+    from .integrations.mcp.authorization import load_authorized_version
+
     ctx = _require_config(config)
     with ctx.session() as session:
-        row = session.get(ResumeVersion, id)
-        if row is None:
-            raise typer.BadParameter(f"resume version {id} not found")
+        row, err = load_authorized_version(session, id, user_id)
+        if err is not None or row is None:
+            raise typer.BadParameter(f"resume version {id} not visible to user '{user_id}'")
         _echo_json({
             "id": row.id, "job_id": row.job_id, "file_path": row.file_path,
             "file_sha256": row.file_sha256, "immutable": row.immutable,
+            "plan_sha256": getattr(row, "plan_sha256", None),
             "fact_snapshot": json.loads(row.fact_snapshot) if row.fact_snapshot else [],
         })
+    ctx.close()
+
+
+def _mcp_store(config: Path | None, user_id: str):
+    """Build a confirmation ledger bound to the configured database."""
+    ctx = _require_config(config)
+    from .integrations.mcp.confirmations import ConfirmationStore
+
+    db_path = Path(resolve_db_path(ctx.settings))
+    store = ConfirmationStore(db_path, session_factory=ctx.sessions)
+    return ctx, store
+
+
+@mcp_app.command("pending")
+def mcp_pending(
+    config: Path = typer.Option(None, "--config"),
+    user_id: str = typer.Option("default", "--user"),
+) -> None:
+    """List write operations awaiting your approval (local human action)."""
+    ctx, store = _mcp_store(config, user_id)
+    rows = store.list_pending(user_id=user_id)
+    if not rows:
+        typer.echo("No pending approvals.")
+    else:
+        _echo_json(rows)
+    ctx.close()
+
+
+@mcp_app.command("preview")
+def mcp_preview(
+    token: str = typer.Argument(..., help="Full confirmation token from prepare_*"),
+    config: Path = typer.Option(None, "--config"),
+    user_id: str = typer.Option("default", "--user"),
+) -> None:
+    """Show the exact approved content behind a token before you approve it."""
+    ctx, store = _mcp_store(config, user_id)
+    record = store.get_record(token, user_id=user_id)
+    if record is None:
+        raise typer.BadParameter("token not found, expired, or belongs to another user")
+    snapshot = store.peek(token, user_id=user_id)
+    _echo_json({
+        "action": record["action"],
+        "status": record["status"],
+        "plan_sha256": record["plan_sha256"],
+        "expires_at": record["expires_at"].isoformat() if record["expires_at"] else None,
+        "snapshot": snapshot,
+    })
+    ctx.close()
+
+
+@mcp_app.command("approve")
+def mcp_approve(
+    token: str = typer.Argument(..., help="Full confirmation token"),
+    config: Path = typer.Option(None, "--config"),
+    user_id: str = typer.Option("default", "--user"),
+) -> None:
+    """Approve a reviewed operation. Only a human at this terminal can call this."""
+    ctx, store = _mcp_store(config, user_id)
+    if store.approve(token, user_id=user_id):
+        typer.echo(f"Approved token for user '{user_id}'. The host may now perform the write.")
+    else:
+        raise typer.BadParameter(
+            "approval failed: token unknown/expired/already decided, or user mismatch"
+        )
+    ctx.close()
+
+
+@mcp_app.command("reject")
+def mcp_reject(
+    token: str = typer.Argument(..., help="Full confirmation token"),
+    config: Path = typer.Option(None, "--config"),
+    user_id: str = typer.Option("default", "--user"),
+) -> None:
+    """Reject an operation. This is irreversible."""
+    ctx, store = _mcp_store(config, user_id)
+    if store.reject(token, user_id=user_id):
+        typer.echo("Rejected. The token can no longer be used.")
+    else:
+        raise typer.BadParameter("reject failed: token unknown/already decided, or user mismatch")
     ctx.close()
 
 

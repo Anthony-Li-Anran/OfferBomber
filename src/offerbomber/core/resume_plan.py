@@ -31,13 +31,20 @@ class ResumeSection(BaseModel):
 
 
 class FactAudit(BaseModel):
-    """Provenance for one fact used in a generated resume."""
+    """Provenance for one fact used in a generated resume.
+
+    Phase 3.3 adds evidence and validation_status so a rewrite is traceable:
+    every rendered claim must map back to source evidence, and anything the
+    system cannot prove stays as the original text with a review marker.
+    """
     fact_id: int
     fact_version: int = 1
     source_id: int | None = None
     original_text: str
     rendered_text: str
     experience_id: int
+    evidence: str | None = None
+    validation_status: str = "VERIFIED"  # VERIFIED | REVIEW_REQUIRED | REVERTED
 
 
 class ResumePlan(BaseModel):

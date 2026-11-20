@@ -1,7 +1,7 @@
 OfferBomber capability status
 =============================
 Updated: 2026-11-20
-Phase: 3.2 (production hardening)
+Phase: 3.3 (MCP security hardening)
 
 This is the authoritative, human-readable status list. It intentionally
 understates rather than overstates capabilities. "Adapter implemented" is NOT
@@ -30,12 +30,17 @@ OpenAI-compatible adapter               LIVE-VERIFIED with real DeepSeek key (20
   - structured JOB_ANALYSIS call        LIVE-VERIFIED (real model output, Pydantic-valid)
   - analyzer invariants (title/id/lang) LIVE-VERIFIED (authoritative fields enforced)
 MCP Server (host-orchestrated mode)     IMPLEMENTED & VERIFIED at protocol level
-  - 12 tools, stdio transport           LIVE-VERIFIED (real MCP handshake/list/call)
-  - host reasoning, L2 write guards     IMPLEMENTED (prepare->confirm->write, single-use token)
+  - 14 tools, stdio transport           LIVE-VERIFIED (real MCP handshake/list/call)
+  - L0/L1/L2 tool grading               IMPLEMENTED (Phase 3.3)
+  - discover_jobs (configured sources)  IMPLEMENTED (Phase 3.3, no arbitrary URL / SSRF)
+  - user-scoped fact access             IMPLEMENTED (Phase 3.3, all-or-nothing authorization)
+  - user-scoped resume versions         IMPLEMENTED (Phase 3.3, schema migration required)
+  - immutable SHA-256-bound plan        IMPLEMENTED (Phase 3.3, no post-approval override)
+  - human approval (local CLI)          IMPLEMENTED (offerbomber mcp approve; Elicitation not used)
+  - SQLite confirmation ledger          IMPLEMENTED (token hash, atomic consume, TTL)
   - WorkBuddy / DeepSeek Harness host   NOT LIVE-VERIFIED (host-side registration pending)
 Automatic job application sending       NOT IMPLEMENTED
 Email management / sync                 NOT IMPLEMENTED
-MCP Server                              NOT IMPLEMENTED
 Scheduler                               NOT IMPLEMENTED
 
 Verification legend
@@ -55,5 +60,12 @@ Notes
   NOT live-verified; that run did not exercise them.
 - The credential used was never written to disk or committed; only env vars were set.
 - No real API key, token, personal resume, or PII is stored in this repository.
-- Credentials are read from environment variables or OS keyring only.
+- Credentials are read from env vars or the user-level file ~/.offerbomber/credentials.json
+  (outside the repo); explicit constructor args override both.
+- Test count is from an actual `pytest -q` run: 139 passed (2026-11-20), not a function count.
+- Test suite: 110 prior + 29 Phase 3.3 security regressions (tests/test_phase33_security.py).
 - Run `offerbomber model doctor` and `offerbomber status` for CLI-reported status.
+- MCP human approval: Elicitation is deliberately NOT used. The MCP spec forbids
+  form-mode elicitation for credentials and it is not a server-verifiable authorization
+  signal; approval runs out-of-band in the local CLI instead.
+- Streamable HTTP transport is NOT implemented; the server is stdio-only.
